@@ -123,7 +123,7 @@ ai = create_ai(num_simulations=400, model_path="model.pt")
 | Ko | Simple ko: move that recreates the position before last half-move is forbidden |
 | **Pass** | **Pass = immediate concession — opponent wins** |
 | Scoring | Chinese area scoring: stones + enclosed empty intersections |
-| Komi | 2.5 (awarded to White) |
+| Komi | 6.5 (awarded to White) |
 
 ---
 
@@ -139,15 +139,22 @@ python ai.py      # 4-move AI sanity check with random-weight network
 ## AI architecture notes
 
 ```
-Input (3 × 9 × 9)
-  plane 0: Black stones
-  plane 1: White stones
-  plane 2: current-player flag (all-1 for Black, all-0 for White)
+Input (10 × 9 × 9)
+  plane 0: own stones
+  plane 1: opponent stones
+  plane 2: current-player flag (1=Black, 0=White)
+  plane 3: own groups with 1 liberty (in atari)
+  plane 4: own groups with 2 liberties
+  plane 5: opponent groups with 1 liberty (capturable immediately)
+  plane 6: opponent groups with 2 liberties
+  plane 7: legal moves for current player
+  plane 8: potential own eyes
+  plane 9: potential opponent eyes
 
-Stem conv → 3 × ResBlock (64 ch) → split:
+Stem conv(128ch) → 5 × ResBlock (128 ch) → split:
 
   Policy head:  conv(2ch) → BN → ReLU → FC(81) → log-softmax
-  Value head:   conv(1ch) → BN → ReLU → FC(64) → FC(1) → tanh
+  Value head:   conv(1ch) → BN → ReLU → FC(128) → FC(1) → tanh
 ```
 
 MCTS uses PUCT selection (`−Q + c·P·√N / (1+n)`).  Values are stored from

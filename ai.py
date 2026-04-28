@@ -295,6 +295,168 @@ def _get_double_atari_moves(
     return {cell for cell, cnt in cell_count.items() if cnt >= 2}
 
 
+def _creates_empty_triangle(
+    board: List[List[int]], r: int, c: int, color: int
+) -> bool:
+    """Return True if placing color at (r,c) would form an empty triangle.
+
+    An empty triangle: three same-color stones in an L-shape where the inner
+    corner cell is empty.  Bad shape — fewer effective liberties than a line.
+    Detection: (r,c) plus one vertical and one horizontal same-color neighbor
+    form the L; if the diagonal cell completing the rectangle is empty, it's
+    an empty triangle.
+    """
+    for dr in (-1, 1):
+        nr = r + dr
+        if not (0 <= nr < BOARD_SIZE) or board[nr][c] != color:
+            continue
+        for dc in (-1, 1):
+            nc = c + dc
+            if not (0 <= nc < BOARD_SIZE) or board[r][nc] != color:
+                continue
+            if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == EMPTY:
+                return True
+    return False
+
+
+def _get_capture_move_sizes(
+    board: List[List[int]], color: int
+) -> Dict[Tuple[int, int], int]:
+    """Return {liberty: total_capturable_stones} for each opponent group in atari.
+
+    When one liberty is shared by multiple groups, their sizes are summed so
+    that a move capturing several groups at once gets the full credit.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    sizes: Dict[Tuple[int, int], int] = {}
+    for stone, group, liberties in _iter_groups(board):
+        if stone != opp or len(liberties) != 1:
+            continue
+        lib = next(iter(liberties))
+        sizes[lib] = sizes.get(lib, 0) + len(group)
+    return sizes
+
+
+def _nakade_vital_points(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells that are vital nakade points inside opponent-enclosed regions.
+
+    A region qualifies when it is enclosed entirely by `color` stones and has
+    3–5 empty cells.  The vital point is any cell whose removal splits the
+    remaining space into components all of size ≤ 1 — no room left for two
+    eyes.  Playing there kills the opponent's eyeless group.
+    """
+    vital: set = set()
+    visited: set = set()
+
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != EMPTY or (r, c) in visited:
+                continue
+            region: set = set()
+            border_colors: set = set()
+            stack = [(r, c)]
+            while stack:
+                rr, cc = stack.pop()
+                if (rr, cc) in region:
+                    continue
+                region.add((rr, cc))
+                for dr, dc in _NEIGHBORS:
+                    nr, nc = rr + dr, cc + dc
+                    if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
+                        if board[nr][nc] == EMPTY and (nr, nc) not in region:
+                            stack.append((nr, nc))
+                        elif board[nr][nc] != EMPTY:
+                            border_colors.add(board[nr][nc])
+            visited |= region
+            if border_colors != {color} or not (3 <= len(region) <= 5):
+                continue
+            for cell in region:
+                remaining = region - {cell}
+                seen: set = set()
+                max_comp = 0
+                for start in remaining:
+                    if start in seen:
+                        continue
+                    comp: set = set()
+                    q = [start]
+                    while q:
+                        cur = q.pop()
+                        if cur in comp:
+                            continue
+                        comp.add(cur)
+                        for dr, dc in _NEIGHBORS:
+                            nb = (cur[0] + dr, cur[1] + dc)
+                            if nb in remaining and nb not in comp:
+                                q.append(nb)
+                    seen |= comp
+                    max_comp = max(max_comp, len(comp))
+                if max_comp <= 1:
+                    vital.add(cell)
+    return vital
+
+
+def _is_losing_ladder(
+    engine: GoEngine, escape_move: Tuple[int, int], depth: int = 14
+) -> bool:
+    """Return True if escape_move leads into a losing ladder for engine.current_player.
+
+    Simulates the forced continuation: attacker reduces the chased group to
+    ≤ 1 liberty each step; group keeps running until it escapes (≥ 3 libs →
+    False) or is captured (0 libs → True).  Depth-limited to avoid slowdown.
+    """
+    color = engine.current_player
+    opp   = WHITE if color == BLACK else BLACK
+
+    sim = engine.clone()
+    if not sim.play(*escape_move):
+        return True
+
+    anchor = escape_move
+
+    for _ in range(depth):
+        if sim.game_over:
+            return False
+        if sim.board[anchor[0]][anchor[1]] != color:
+            return True  # group was captured
+
+        _, libs = sim._get_group(*anchor)
+        n = len(libs)
+        if n == 0:
+            return True
+        if n >= 3:
+            return False  # escaped the chase
+
+        if sim.current_player == opp:
+            # Attacker tries the liberty that reduces our group to ≤ 1 lib.
+            continued = False
+            for lib in list(libs):
+                if not sim.is_legal(*lib):
+                    continue
+                sim2 = sim.clone()
+                sim2.play(*lib)
+                if sim2.board[anchor[0]][anchor[1]] != color:
+                    return True  # directly captured
+                _, l2 = sim2._get_group(*anchor)
+                if len(l2) <= 1:
+                    sim = sim2
+                    continued = True
+                    break
+            if not continued:
+                return False  # attacker cannot maintain the chase
+        else:
+            if n == 1:
+                only = next(iter(libs))
+                if not sim.play(*only):
+                    return True
+                anchor = only
+            else:
+                return False  # 2 libs on our own turn → not a forced ladder
+
+    return False
+
+
 def _eye_score(
     board: List[List[int]], r: int, c: int, color: int
 ) -> Tuple[int, int]:
@@ -463,6 +625,390 @@ class GoNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Additional tactical helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_cut_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells that are cutting points against opponent groups.
+
+    Two patterns detected:
+    (a) Adjacency cut: cell touches ≥ 2 distinct opponent groups — our stone
+        there prevents those groups from connecting.
+    (b) Diagonal crosscut: two opponent stones are diagonally adjacent with
+        both bridging cells empty — either bridging cell separates them.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    group_id: Dict[Tuple[int, int], int] = {}
+    visited: set = set()
+    gid = 0
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != opp or (r, c) in visited:
+                continue
+            group: set = set()
+            stack = [(r, c)]
+            while stack:
+                rr, cc = stack.pop()
+                if (rr, cc) in group:
+                    continue
+                group.add((rr, cc))
+                for dr, dc in _NEIGHBORS:
+                    nr, nc = rr + dr, cc + dc
+                    if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
+                        if board[nr][nc] == opp and (nr, nc) not in group:
+                            stack.append((nr, nc))
+            for cell in group:
+                group_id[cell] = gid
+            visited |= group
+            gid += 1
+
+    cuts: set = set()
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != EMPTY:
+                continue
+            adj_groups: set = set()
+            for dr, dc in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and (nr, nc) in group_id:
+                    adj_groups.add(group_id[(nr, nc)])
+            if len(adj_groups) >= 2:
+                cuts.add((r, c))
+
+    for r in range(BOARD_SIZE - 1):
+        for c in range(BOARD_SIZE - 1):
+            if board[r][c] == opp and board[r + 1][c + 1] == opp:
+                if board[r][c + 1] == EMPTY:
+                    cuts.add((r, c + 1))
+                if board[r + 1][c] == EMPTY:
+                    cuts.add((r + 1, c))
+            if board[r][c + 1] == opp and board[r + 1][c] == opp:
+                if board[r][c] == EMPTY:
+                    cuts.add((r, c))
+                if board[r + 1][c + 1] == EMPTY:
+                    cuts.add((r + 1, c + 1))
+    return cuts
+
+
+def _count_tiger_mouths_created(
+    board: List[List[int]], r: int, c: int, color: int
+) -> int:
+    """Count empty neighbor cells that would become a 虎口 (tiger's mouth) for color.
+
+    A tiger's mouth is an empty cell with ≥ 3 in-bounds orthogonal neighbors of
+    the same color — strong shape that the opponent cannot safely enter.
+    """
+    count = 0
+    for dr, dc in _NEIGHBORS:
+        nr, nc = r + dr, c + dc
+        if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE) or board[nr][nc] != EMPTY:
+            continue
+        color_nbrs = 0
+        in_bounds = 0
+        for dr2, dc2 in _NEIGHBORS:
+            nr2, nc2 = nr + dr2, nc + dc2
+            if not (0 <= nr2 < BOARD_SIZE and 0 <= nc2 < BOARD_SIZE):
+                continue
+            in_bounds += 1
+            if (nr2, nc2) == (r, c) or board[nr2][nc2] == color:
+                color_nbrs += 1
+        if in_bounds >= 3 and color_nbrs >= 3:
+            count += 1
+    return count
+
+
+def _get_weak_group_pressure_moves(
+    board: List[List[int]], color: int, max_liberties: int = 3
+) -> set:
+    """Return the liberties of opponent groups with few liberties (2–max_liberties).
+
+    These empty cells are adjacent to groups that are already under pressure.
+    Playing there tightens the net one step before issuing a formal atari —
+    making follow-up captures much easier.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    pressure: set = set()
+    for stone, _group, liberties in _iter_groups(board):
+        if stone == opp and 2 <= len(liberties) <= max_liberties:
+            pressure |= liberties
+    return pressure
+
+
+def _get_semeai_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """In liberty races (攻殺/semeai), return the opponent's exclusive liberties to fill.
+
+    When one of our groups is adjacent to an opponent group and both have ≤ 5
+    liberties, the side that fills external liberties first wins.  Returns the
+    opponent's exclusive liberties (those not shared with our group) so MCTS
+    explores the correct 'outside attack' moves.
+    """
+    opp = WHITE if color == BLACK else BLACK
+
+    all_groups: Dict[int, Tuple] = {}
+    cell_to_gid: Dict[Tuple[int, int], int] = {}
+    gid = 0
+    for stone, cells, libs in _iter_groups(board):
+        all_groups[gid] = (stone, cells, libs)
+        for cell in cells:
+            cell_to_gid[cell] = gid
+        gid += 1
+
+    result: set = set()
+    for our_id, (stone_a, cells_a, libs_a) in all_groups.items():
+        if stone_a != color or len(libs_a) > 5:
+            continue
+        adj_opp: set = set()
+        for r, c in cells_a:
+            for dr, dc in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                if (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE
+                        and board[nr][nc] == opp and (nr, nc) in cell_to_gid):
+                    adj_opp.add(cell_to_gid[(nr, nc)])
+        for opp_id in adj_opp:
+            _, _cells_b, libs_b = all_groups[opp_id]
+            if len(libs_b) <= 5:
+                result |= libs_b - libs_a  # opponent's exclusive liberties
+    return result
+
+
+def _get_hane_at_head_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells at the 'head' of opponent stone lines (頭頂).
+
+    When 2+ opponent stones are in a straight line, playing at either end
+    applies direct pressure ('hane at the head') — a classic shape that
+    restricts the opponent's development and often sets up atari.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    moves: set = set()
+
+    for dr, dc in ((0, 1), (1, 0)):
+        for r in range(BOARD_SIZE):
+            for c in range(BOARD_SIZE):
+                pr, pc = r - dr, c - dc
+                if (0 <= pr < BOARD_SIZE and 0 <= pc < BOARD_SIZE
+                        and board[pr][pc] == opp):
+                    continue  # not the start of the run
+                if board[r][c] != opp:
+                    continue
+                end_r, end_c = r, c
+                while True:
+                    nr, nc = end_r + dr, end_c + dc
+                    if (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE
+                            and board[nr][nc] == opp):
+                        end_r, end_c = nr, nc
+                    else:
+                        break
+                run_len = max(abs(end_r - r), abs(end_c - c)) + 1
+                if run_len < 2:
+                    continue
+                for hr, hc in (
+                    (r - dr, c - dc),
+                    (end_r + dr, end_c + dc),
+                ):
+                    if (0 <= hr < BOARD_SIZE and 0 <= hc < BOARD_SIZE
+                            and board[hr][hc] == EMPTY):
+                        moves.add((hr, hc))
+    return moves
+
+
+def _get_vulnerable_connection_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return our connection points (bamboo joints / bridges) threatened by opponent.
+
+    An empty cell is a vulnerable connection when it is adjacent to ≥ 2 of our
+    own stones (so playing there connects groups) AND ≥ 1 opponent stone
+    (so the opponent threatens to cut through that cell).  Playing there
+    preemptively protects the connection before a cut can happen.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    result: set = set()
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != EMPTY:
+                continue
+            own_adj = opp_adj = 0
+            for dr, dc in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                    continue
+                if board[nr][nc] == color:
+                    own_adj += 1
+                elif board[nr][nc] == opp:
+                    opp_adj += 1
+            if own_adj >= 2 and opp_adj >= 1:
+                result.add((r, c))
+    return result
+
+
+def _is_ko_active(
+    board: List[List[int]], previous_board: Optional[List[List[int]]]
+) -> bool:
+    """Return True when there is an active ko fight.
+
+    A ko exists when the current board differs from the previous state by exactly
+    2 cells (one stone placed, one stone captured via a single-stone removal).
+    """
+    if previous_board is None:
+        return False
+    diff = sum(
+        1 for r in range(BOARD_SIZE) for c in range(BOARD_SIZE)
+        if board[r][c] != previous_board[r][c]
+    )
+    return diff == 2
+
+
+def _get_boundary_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells on the border between own and opponent territory.
+
+    Each boundary cell is adjacent to both our stones and opponent stones.
+    Playing first gains roughly 1 point; these are the key endgame moves.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    boundary: set = set()
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != EMPTY:
+                continue
+            has_own = has_opp = False
+            for dr, dc in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                    continue
+                if board[nr][nc] == color:
+                    has_own = True
+                elif board[nr][nc] == opp:
+                    has_opp = True
+            if has_own and has_opp:
+                boundary.add((r, c))
+    return boundary
+
+
+def _find_snapback_escapes(
+    board: List[List[int]], color: int
+) -> set:
+    """Return our escape moves we should skip because not escaping creates a snapback.
+
+    If our group is in atari at liberty L and letting the opponent capture us would
+    leave their capturing group with exactly 1 liberty (which we can immediately
+    recapture), AND their group is larger than ours, we gain net material by NOT
+    escaping — the snapback recapture is more valuable than saving our own stones.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    skip: set = set()
+
+    for stone, group, libs in _iter_groups(board):
+        if stone != color or len(libs) != 1:
+            continue
+        lib = next(iter(libs))
+
+        temp = [row[:] for row in board]
+        for r, c in group:
+            temp[r][c] = EMPTY
+        temp[lib[0]][lib[1]] = opp
+
+        opp_grp: set = set()
+        opp_libs: set = set()
+        stack = [lib]
+        while stack:
+            rr, cc = stack.pop()
+            if (rr, cc) in opp_grp or temp[rr][cc] != opp:
+                continue
+            opp_grp.add((rr, cc))
+            for dr, dc in _NEIGHBORS:
+                nr, nc = rr + dr, cc + dc
+                if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                    continue
+                if temp[nr][nc] == opp and (nr, nc) not in opp_grp:
+                    stack.append((nr, nc))
+                elif temp[nr][nc] == EMPTY:
+                    opp_libs.add((nr, nc))
+
+        if len(opp_libs) == 1 and len(opp_grp) > len(group):
+            skip.add(lib)
+    return skip
+
+
+def _get_last_move(
+    board: List[List[int]],
+    previous_board: Optional[List[List[int]]],
+    opp_color: int,
+) -> Optional[Tuple[int, int]]:
+    """Return the cell where opp_color just played, or None."""
+    if previous_board is None:
+        return None
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] == opp_color and previous_board[r][c] != opp_color:
+                return (r, c)
+    return None
+
+
+def _get_pattern_response_moves(
+    board: List[List[int]],
+    color: int,
+    last_opp_move: Optional[Tuple[int, int]],
+) -> Dict[Tuple[int, int], float]:
+    """Return {move: multiplier} for pattern-based responses to opponent's last move.
+
+    Pattern A — Tsuke (contact): opponent attached to our stone.
+      · Hane: perpendicular turning move adjacent to our stone (×1.8).
+      · Nobi: extend our stone in the contact direction away from opponent (×1.5).
+
+    Pattern B — Peep-block: opponent is adjacent to our stone and a second of our
+      stones flanks the contact, threatening a diagonal cut.
+      Boost the cell that keeps us connected (×1.7).
+    """
+    if last_opp_move is None:
+        return {}
+
+    lr, lc = last_opp_move
+    responses: Dict[Tuple[int, int], float] = {}
+
+    for dr, dc in _NEIGHBORS:
+        our_r, our_c = lr + dr, lc + dc
+        if not (0 <= our_r < BOARD_SIZE and 0 <= our_c < BOARD_SIZE):
+            continue
+        if board[our_r][our_c] != color:
+            continue
+        # --- Pattern A ---
+        # Nobi: extend away from opponent in the same direction
+        ext_r, ext_c = our_r + dr, our_c + dc
+        if (0 <= ext_r < BOARD_SIZE and 0 <= ext_c < BOARD_SIZE
+                and board[ext_r][ext_c] == EMPTY):
+            responses[(ext_r, ext_c)] = responses.get((ext_r, ext_c), 1.0) * 1.5
+        # Hane: perpendicular to the contact axis, adjacent to our stone
+        for h_dr, h_dc in ((-dc, dr), (dc, -dr)):
+            h_r, h_c = our_r + h_dr, our_c + h_dc
+            if (0 <= h_r < BOARD_SIZE and 0 <= h_c < BOARD_SIZE
+                    and board[h_r][h_c] == EMPTY):
+                responses[(h_r, h_c)] = responses.get((h_r, h_c), 1.0) * 1.8
+
+        # --- Pattern B ---
+        for perp_dr, perp_dc in ((-dc, dr), (dc, -dr)):
+            sec_r, sec_c = our_r + perp_dr, our_c + perp_dc
+            if not (0 <= sec_r < BOARD_SIZE and 0 <= sec_c < BOARD_SIZE):
+                continue
+            if board[sec_r][sec_c] != color:
+                continue
+            blk_r, blk_c = lr + perp_dr, lc + perp_dc
+            if (0 <= blk_r < BOARD_SIZE and 0 <= blk_c < BOARD_SIZE
+                    and board[blk_r][blk_c] == EMPTY):
+                responses[(blk_r, blk_c)] = responses.get((blk_r, blk_c), 1.0) * 1.7
+
+    return responses
+
+
+# ---------------------------------------------------------------------------
 # MCTS
 # ---------------------------------------------------------------------------
 
@@ -543,6 +1089,19 @@ class MCTS:
         atari_escape_bias: float = 4.0,
         connection_penalty: float = 0.35,
         double_atari_bias: float = 3.0,
+        gameplay_temperature: float = 0.8,
+        edge_penalty: float = 0.04,
+        empty_triangle_penalty: float = 0.6,
+        nakade_bias: float = 3.0,
+        cut_bias: float = 2.5,
+        tiger_mouth_bias: float = 1.5,
+        ko_threat_multiplier: float = 1.5,
+        boundary_bias: float = 2.0,
+        weak_group_pressure_bias: float = 2.0,
+        semeai_bias: float = 3.0,
+        hane_bias: float = 2.0,
+        connection_guard_bias: float = 2.5,
+        pattern_response_bias: float = 1.0,
     ) -> None:
         self.model           = model.to(device)
         self.model.set_inference_mode()
@@ -564,15 +1123,49 @@ class MCTS:
         # capture_bias: prior multiplier for moves that capture opponent in atari
         # atari_escape_bias: prior multiplier for moves that escape own atari
         # connection_penalty: prior multiplier for moves that only connect safe own groups
-        self.capture_bias       = capture_bias
-        self.atari_escape_bias  = atari_escape_bias
-        self.connection_penalty = connection_penalty
-        self.double_atari_bias  = double_atari_bias
+        self.capture_bias         = capture_bias
+        self.atari_escape_bias    = atari_escape_bias
+        self.connection_penalty   = connection_penalty
+        self.double_atari_bias    = double_atari_bias
+        # temperature > 0: sample from visit-count distribution instead of argmax,
+        # introducing game-to-game variety without sacrificing tactical accuracy
+        self.gameplay_temperature = gameplay_temperature
+        # edge_penalty: prior multiplier for first-line moves that have no
+        # tactical justification (capture/escape/eye/double-atari exempt)
+        self.edge_penalty             = edge_penalty
+        # empty_triangle_penalty: prior multiplier for moves that form bad L-shape
+        self.empty_triangle_penalty   = empty_triangle_penalty
+        # nakade_bias: prior multiplier for vital points inside opponent eye-spaces
+        self.nakade_bias              = nakade_bias
+        # cut_bias: prior multiplier for moves that separate distinct opponent groups
+        self.cut_bias                 = cut_bias
+        # tiger_mouth_bias: prior multiplier per tiger's mouth shape created
+        self.tiger_mouth_bias         = tiger_mouth_bias
+        # ko_threat_multiplier: extra boost to capture/atari moves when a ko is active
+        self.ko_threat_multiplier     = ko_threat_multiplier
+        # boundary_bias: boost territory boundary moves in late game (≥50 stones on board)
+        self.boundary_bias              = boundary_bias
+        # weak_group_pressure_bias: boost liberties of opponent groups with 2-3 liberties
+        self.weak_group_pressure_bias   = weak_group_pressure_bias
+        # semeai_bias: boost opponent exclusive liberties in adjacent liberty races
+        self.semeai_bias                = semeai_bias
+        # hane_bias: boost cells at the head of opponent stone lines
+        self.hane_bias                  = hane_bias
+        # connection_guard_bias: boost our threatened connection points (bamboo joints)
+        self.connection_guard_bias      = connection_guard_bias
+        # pattern_response_bias: strength multiplier for pattern-based responses (tsuke/peep)
+        self.pattern_response_bias      = pattern_response_bias
         self._eval_cache: Dict[bytes, Tuple[np.ndarray, float]] = {}
+        self._opening_priorities  = random.sample(_OPENING_PRIORITIES, len(_OPENING_PRIORITIES))
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def reset_game(self) -> None:
+        """Reshuffle opening priorities and clear the eval cache for a new game."""
+        self._opening_priorities = random.sample(_OPENING_PRIORITIES, len(_OPENING_PRIORITIES))
+        self._eval_cache.clear()
 
     def check_resign(self, engine: GoEngine) -> bool:
         """Return True when a single NN eval says the position is hopeless.
@@ -602,20 +1195,26 @@ class MCTS:
                 return legal_caps[0]
 
             # 2. Escape own atari: force when there is exactly one escape candidate
-            #    AND the escape actually gains liberties (not a futile one-step chase).
-            #    Multiple escapes, or a futile single escape → MCTS with atari_escape_bias.
+            #    AND the escape gains real liberties AND it does not lead into a ladder
+            #    AND not escaping would NOT produce a beneficial snapback.
+            #    Multiple escapes, futile escapes, ladder escapes, or snapbacks → MCTS.
             legal_escs = sorted(esc_moves & legal_set)
-            if len(legal_escs) == 1 and not _escape_is_futile(engine, legal_escs[0]):
-                return legal_escs[0]
+            if len(legal_escs) == 1:
+                esc = legal_escs[0]
+                snapback_skips = _find_snapback_escapes(engine.board, engine.current_player)
+                if (esc not in snapback_skips
+                        and not _escape_is_futile(engine, esc)
+                        and not _is_losing_ladder(engine, esc)):
+                    return esc
 
             # 3. Opening corners (only when no tactical urgency, and not filling own eye).
             own_stones = sum(
                 engine.board[r][c] == engine.current_player
                 for r in range(BOARD_SIZE) for c in range(BOARD_SIZE)
             )
-            if own_stones < len(_OPENING_PRIORITIES):
+            if own_stones < len(self._opening_priorities):
                 cur = engine.current_player
-                for move in _OPENING_PRIORITIES:
+                for move in self._opening_priorities:
                     r, c = move
                     if engine.is_legal(r, c) and not _is_own_eye(engine.board, r, c, cur):
                         return move
@@ -640,12 +1239,42 @@ class MCTS:
                 return None  # all remaining moves are own eyes → pass
             return random.choice(non_eye)
 
-        best = max(root.children, key=lambda m: root.children[m].visit_count)
+        # Move selection: temperature=0 → argmax (deterministic);
+        # temperature>0 → sample proportionally to visit_count^(1/T) for variety.
+        T = self.gameplay_temperature if not self.training else 0.0
+        if T > 0.0:
+            candidates = list(root.children.items())
+            weights = [ch.visit_count ** (1.0 / T) for _, ch in candidates]
+            total_w = sum(weights) or 1.0
+            r_val = random.random() * total_w
+            cumsum = 0.0
+            best = candidates[0][0]
+            for (move, _), w in zip(candidates, weights):
+                cumsum += w
+                if cumsum >= r_val:
+                    best = move
+                    break
+        else:
+            best = max(root.children, key=lambda m: root.children[m].visit_count)
+
         if not allow_pass and best == _PASS:
             # Human rejected our pass — must play a real board move.
             non_pass = {m: ch for m, ch in root.children.items() if m != _PASS}
             if non_pass:
-                best = max(non_pass, key=lambda m: non_pass[m].visit_count)
+                if T > 0.0:
+                    cands = list(non_pass.items())
+                    ws = [ch.visit_count ** (1.0 / T) for _, ch in cands]
+                    tw = sum(ws) or 1.0
+                    rv = random.random() * tw
+                    cs = 0.0
+                    best = cands[0][0]
+                    for (mv, _), w in zip(cands, ws):
+                        cs += w
+                        if cs >= rv:
+                            best = mv
+                            break
+                else:
+                    best = max(non_pass, key=lambda m: non_pass[m].visit_count)
             else:
                 return None  # truly no legal moves; accept the pass situation
         return None if best == _PASS else best
@@ -753,9 +1382,11 @@ class MCTS:
                 sim_i.board, sim_i.current_player, expand_legal
             )
 
-            board_i  = sim_i.board
-            color_i  = sim_i.current_player
-            cpasses_i = sim_i.consecutive_passes
+            board_i      = sim_i.board
+            color_i      = sim_i.current_player
+            cpasses_i    = sim_i.consecutive_passes
+            ko_i         = _is_ko_active(board_i, sim_i.previous_board)
+            last_move_i  = _get_last_move(board_i, sim_i.previous_board, opponent(color_i))
             key = self._cache_key(sim_i)
             if key in self._eval_cache:
                 policy, value = self._eval_cache[key]
@@ -763,17 +1394,18 @@ class MCTS:
                     paths[i][-1], expand_legal, policy,
                     self.training and (paths[i][-1] is root),
                     board=board_i, color=color_i, value=value,
-                    consecutive_passes=cpasses_i,
+                    consecutive_passes=cpasses_i, ko_active=ko_i,
+                    last_opp_move=last_move_i,
                 )
                 leaf_values[i] = value
             else:
                 to_eval.append((i, paths[i][-1], sim_i, leaf_legal, expand_legal,
-                                 board_i, color_i, cpasses_i, key))
+                                 board_i, color_i, cpasses_i, key, ko_i, last_move_i))
 
         if to_eval:
             # Stack boards into one batch tensor — one forward pass for all
             tensors = torch.stack([
-                encode_board(sim, ll) for _, _, sim, ll, _, _, _, _, _ in to_eval
+                encode_board(sim, ll) for _, _, sim, ll, _, _, _, _, _, _, _ in to_eval
             ]).to(self.device)
 
             with torch.inference_mode():
@@ -782,7 +1414,7 @@ class MCTS:
             values_arr = vt.squeeze(1).cpu().numpy()
 
             for j, (i, leaf, sim, leaf_legal, expand_legal,
-                    board_j, color_j, cpasses_j, key) in enumerate(to_eval):
+                    board_j, color_j, cpasses_j, key, ko_j, last_move_j) in enumerate(to_eval):
                 policy = policies[j]
                 value  = float(values_arr[j])
                 self._eval_cache[key] = (policy, value)
@@ -790,7 +1422,8 @@ class MCTS:
                     leaf, expand_legal, policy,
                     self.training and (leaf is root),
                     board=board_j, color=color_j, value=value,
-                    consecutive_passes=cpasses_j,
+                    consecutive_passes=cpasses_j, ko_active=ko_j,
+                    last_opp_move=last_move_j,
                 )
                 leaf_values[i] = value
 
@@ -849,6 +1482,8 @@ class MCTS:
         color: Optional[int] = None,
         value: float = 0.0,
         consecutive_passes: int = 0,
+        ko_active: bool = False,
+        last_opp_move: Optional[Tuple[int, int]] = None,
     ) -> None:
         """Populate node.children from policy array.  No-op if already expanded."""
         if node.children:
@@ -882,28 +1517,33 @@ class MCTS:
                     if bonus > 0.0:
                         raw[move] *= 1.0 + bonus
 
-        # --- Capture / atari-escape bias (gameplay only) ---
-        # During gameplay we hugely amplify priors for moves that capture
-        # an opponent group in atari or save one of our own groups in
-        # atari.  These are nearly always urgent in real play.
-        # Disabled during self-play training so the move distribution
-        # stays natural and the network learns tactics from game outcomes
-        # rather than from hand-tuned priors.
+        # --- Gameplay-only prior shaping (all heuristics disabled during training) ---
+        # Tactical sets are computed once here and reused by every heuristic below
+        # to avoid redundant board scans.
         if not self.training and board is not None and color is not None:
-            if self.capture_bias > 1.0 or self.atari_escape_bias > 1.0:
-                cap_moves, esc_moves = _get_tactical_moves(board, color)
+            capture_sizes = _get_capture_move_sizes(board, color)  # {lib: stones_captured}
+            cap_moves     = set(capture_sizes)
+            _, esc_moves  = _get_tactical_moves(board, color)
+            da_moves = (
+                _get_double_atari_moves(board, color)
+                if self.double_atari_bias > 1.0 or self.edge_penalty < 1.0
+                else set()
+            )
+
+            # Capture bias: scale by log(group_size) so capturing large groups
+            # gets proportionally more exploration than capturing lone stones.
+            if self.capture_bias > 1.0:
+                for move, size in capture_sizes.items():
+                    if move in raw:
+                        raw[move] *= self.capture_bias * (1.0 + 0.5 * math.log1p(size - 1))
+
+            # Atari-escape bias: amplify priors for moves that save own groups.
+            if self.atari_escape_bias > 1.0:
                 for move in raw:
-                    if move in cap_moves:
-                        raw[move] *= self.capture_bias
                     if move in esc_moves:
                         raw[move] *= self.atari_escape_bias
 
-            # --- Connection penalty (gameplay only) ---
-            # Beginners' nets often play solid but pointless connection
-            # moves between groups that are already safe.  We multiply
-            # the prior of any such move by connection_penalty (<1.0) so
-            # MCTS shifts visits to higher-leverage moves.  Connections
-            # under genuine pressure (any opponent neighbour) are exempt.
+            # Connection penalty: discount moves that only connect already-safe groups.
             if self.connection_penalty < 1.0:
                 for move in raw:
                     if move != _PASS:
@@ -911,16 +1551,122 @@ class MCTS:
                         if _is_wasteful_connection(board, r, c, color):
                             raw[move] *= self.connection_penalty
 
-            # --- Double atari bias (gameplay only) ---
-            # A move that simultaneously threatens two opponent groups
-            # (each currently at 2 liberties) is very strong — the
-            # opponent can only save one.  Boost its prior so MCTS
-            # explores it heavily without hard-overriding the NN.
+            # Double atari bias: boost moves that threaten two opponent groups at once.
             if self.double_atari_bias > 1.0:
-                da_moves = _get_double_atari_moves(board, color)
                 for move in raw:
                     if move in da_moves:
                         raw[move] *= self.double_atari_bias
+
+            # Cut bias: boost moves that separate two or more distinct opponent groups.
+            if self.cut_bias > 1.0:
+                cut_moves = _get_cut_moves(board, color)
+                for move in raw:
+                    if move in cut_moves:
+                        raw[move] *= self.cut_bias
+
+            # Tiger's mouth bias: boost moves that create 虎口 (3-sided enclosed) shapes.
+            # Stack the multiplier for each tiger's mouth created (usually 0 or 1).
+            if self.tiger_mouth_bias > 1.0:
+                for move in raw:
+                    if move == _PASS:
+                        continue
+                    r, c = move
+                    mouths = _count_tiger_mouths_created(board, r, c, color)
+                    if mouths > 0:
+                        raw[move] *= self.tiger_mouth_bias ** mouths
+
+            # Ko threat multiplier: when a ko fight is active, extra-boost captures
+            # and atari-escape moves so MCTS finds good ko threats faster.
+            if ko_active and self.ko_threat_multiplier > 1.0:
+                for move in raw:
+                    if move in cap_moves or move in esc_moves:
+                        raw[move] *= self.ko_threat_multiplier
+
+            # Boundary bias: in the late game (≥ 50 stones), boost moves on the
+            # boundary between own and opponent territory — each is worth ~1 point.
+            if self.boundary_bias > 1.0:
+                stone_count = sum(
+                    1 for rr in range(BOARD_SIZE) for cc in range(BOARD_SIZE)
+                    if board[rr][cc] != EMPTY
+                )
+                if stone_count >= 50:
+                    boundary = _get_boundary_moves(board, color)
+                    for move in raw:
+                        if move in boundary:
+                            raw[move] *= self.boundary_bias
+
+            # Empty triangle penalty: discourage moves that form bad L-shape.
+            # Exempt captures and escapes which may require bad-shape moves.
+            if self.empty_triangle_penalty < 1.0:
+                for move in raw:
+                    if move == _PASS or move in cap_moves or move in esc_moves:
+                        continue
+                    r, c = move
+                    if _creates_empty_triangle(board, r, c, color):
+                        raw[move] *= self.empty_triangle_penalty
+
+            # Nakade bias: boost vital points inside opponent enclosed eyespaces
+            # to encourage killing groups rather than letting them live with two eyes.
+            if self.nakade_bias > 1.0:
+                vital = _nakade_vital_points(board, color)
+                for move in raw:
+                    if move in vital:
+                        raw[move] *= self.nakade_bias
+
+            # Weak group pressure: tighten the net around opponent groups with 2-3 liberties.
+            if self.weak_group_pressure_bias > 1.0:
+                pressure = _get_weak_group_pressure_moves(board, color)
+                for move in raw:
+                    if move in pressure:
+                        raw[move] *= self.weak_group_pressure_bias
+
+            # Semeai bias: in adjacent liberty races, fill opponent's exclusive liberties first.
+            if self.semeai_bias > 1.0:
+                semeai = _get_semeai_moves(board, color)
+                for move in raw:
+                    if move in semeai:
+                        raw[move] *= self.semeai_bias
+
+            # Hane at the head: apply pressure to the end of opponent stone lines.
+            if self.hane_bias > 1.0:
+                hane = _get_hane_at_head_moves(board, color)
+                for move in raw:
+                    if move in hane:
+                        raw[move] *= self.hane_bias
+
+            # Connection guard: boost threatened bamboo joints / bridge points.
+            if self.connection_guard_bias > 1.0:
+                guard = _get_vulnerable_connection_moves(board, color)
+                for move in raw:
+                    if move in guard:
+                        raw[move] *= self.connection_guard_bias
+
+            # Pattern response: boost tsuke (contact) and peep-block responses.
+            if self.pattern_response_bias > 0.0 and last_opp_move is not None:
+                pattern_resp = _get_pattern_response_moves(board, color, last_opp_move)
+                for move, mult in pattern_resp.items():
+                    if move in raw:
+                        raw[move] *= 1.0 + (mult - 1.0) * self.pattern_response_bias
+
+            # Edge penalty: heavily discount first-line moves with no tactical purpose.
+            # Exemptions: capture, escape, double-atari, nakade vital points, semeai fills,
+            # making/blocking eyes — all of these can legitimately occur on the first line.
+            if self.edge_penalty < 1.0:
+                tactical = (cap_moves | esc_moves | da_moves
+                            | _nakade_vital_points(board, color)
+                            | _get_semeai_moves(board, color))
+                for move in raw:
+                    if move == _PASS:
+                        continue
+                    r, c = move
+                    if min(r, BOARD_SIZE - 1 - r, c, BOARD_SIZE - 1 - c) > 0:
+                        continue  # not a first-line cell
+                    if move in tactical:
+                        continue
+                    own_e, opp_e = _eye_score(board, r, c, color)
+                    if own_e > 0 or opp_e > 0:
+                        continue
+                    raw[move] *= self.edge_penalty
 
         # --- Pass move ---
         # Pass is treated as a special child with prior derived from the
@@ -978,6 +1724,19 @@ def create_ai(
     atari_escape_bias: float = 4.0,
     connection_penalty: float = 0.35,
     double_atari_bias: float = 3.0,
+    gameplay_temperature: float = 0.8,
+    edge_penalty: float = 0.04,
+    empty_triangle_penalty: float = 0.6,
+    nakade_bias: float = 3.0,
+    cut_bias: float = 2.5,
+    tiger_mouth_bias: float = 1.5,
+    ko_threat_multiplier: float = 1.5,
+    boundary_bias: float = 2.0,
+    weak_group_pressure_bias: float = 2.0,
+    semeai_bias: float = 3.0,
+    hane_bias: float = 2.0,
+    connection_guard_bias: float = 2.5,
+    pattern_response_bias: float = 1.0,
 ) -> MCTS:
     if device is None:
         if torch.cuda.is_available():
@@ -1000,7 +1759,20 @@ def create_ai(
                 pass_weight=pass_weight, resign_threshold=resign_threshold,
                 capture_bias=capture_bias, atari_escape_bias=atari_escape_bias,
                 connection_penalty=connection_penalty,
-                double_atari_bias=double_atari_bias)
+                double_atari_bias=double_atari_bias,
+                gameplay_temperature=gameplay_temperature,
+                edge_penalty=edge_penalty,
+                empty_triangle_penalty=empty_triangle_penalty,
+                nakade_bias=nakade_bias,
+                cut_bias=cut_bias,
+                tiger_mouth_bias=tiger_mouth_bias,
+                ko_threat_multiplier=ko_threat_multiplier,
+                boundary_bias=boundary_bias,
+                weak_group_pressure_bias=weak_group_pressure_bias,
+                semeai_bias=semeai_bias,
+                hane_bias=hane_bias,
+                connection_guard_bias=connection_guard_bias,
+                pattern_response_bias=pattern_response_bias)
 
 
 # ---------------------------------------------------------------------------

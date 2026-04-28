@@ -115,13 +115,14 @@ def draw_stone(surf, row, col, color, last=False):
 
 
 def draw_coord_labels(surf, font):
-    letters = "ABCDEFGHJ"
+    letters = "ABCDEFGHI"
     for i in range(BOARD_SIZE):
         cx, cy = _cell_to_px(0, i)
         l = font.render(letters[i], True, C_TEXT)
         surf.blit(l, (cx - l.get_width()//2, MARGIN - CELL//2 - l.get_height() - 2))
-        l = font.render(str(BOARD_SIZE-i), True, C_TEXT)
-        surf.blit(l, (MARGIN - CELL//2 - l.get_width() - 4, cy - l.get_height()//2))
+        _, ry = _cell_to_px(i, 0)
+        r = font.render(str(i), True, C_TEXT)
+        surf.blit(r, (MARGIN - CELL//2 - r.get_width() - 4, ry - r.get_height()//2))
 
 
 def draw_panel(surf, engine, ai_thinking, mode, human_color, fonts,
@@ -415,6 +416,7 @@ def run(num_simulations: int = 200, skip_menu: bool = False,
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if btn_new.collidepoint(event.pos):
                     engine = GoEngine()
+                    ai.reset_game()
                     ai_result.clear(); ai_thinking = False
                     maybe_start_ai()
                 elif btn_menu.collidepoint(event.pos):

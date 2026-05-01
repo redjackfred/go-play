@@ -32,13 +32,94 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from board import BLACK, BOARD_SIZE, WHITE, GoEngine
-from ai import GoNet, MCTS, create_ai, encode_board
+from ai import (GoNet, MCTS, create_ai, encode_board,
+                _count_group_real_eyes, _iter_groups, _get_purposeless_moves,
+                _STAR_POSITIONS)
 
 # Normalize score difference to [-1, 1].  A 40-point margin → ±1.0.
 # Using score difference (instead of binary win/loss) breaks the komi
 # feedback loop: positions won only by komi margin (~6.5 pts) produce
 # small values near 0 rather than a sharp ±1 discontinuity.
 _SCORE_NORM = 40.0
+
+# ---------------------------------------------------------------------------
+# Intermediate reward shaping weights
+# ---------------------------------------------------------------------------
+# Each shaping value is expressed in the same [-1, 1] scale as the final
+# outcome.  Kept small so the game result still dominates; shaping only
+# provides early, dense feedback to speed up learning.
+
+_CAPTURE_REWARD    =  0.08   # per opponent stone captured
+_LOSS_PENALTY      =  0.08   # per own stone lost to opponent
+_EYE_BONUS         =  0.15   # per own group that newly secures 2 real eyes
+_GROUP_DEATH_PENALTY = 0.20  # per own group entirely killed by opponent
+_STAR_BONUS        =  0.06   # for occupying a hoshi point this move
+_PURPOSELESS_PEN   =  0.03   # for playing a move with no local purpose
+
+
+def _snapshot_groups(board) -> dict:
+    """Return {frozenset(cells): n_eyes} for every stone group on the board."""
+    return {
+        frozenset(group): _count_group_real_eyes(board, liberties, stone)
+        for stone, group, liberties in _iter_groups(board)
+    }
+
+
+def _compute_shaping(
+    board_before,
+    board_after,
+    move,
+    color: int,
+    cap_before: dict,
+    cap_after: dict,
+    groups_before: dict,
+    groups_after: dict,
+) -> float:
+    """Compute per-move shaping reward for `color` playing `move`.
+
+    Positive = good for `color`, negative = bad for `color`.
+    All values are in [-1, 1] scale (same as final outcome).
+    """
+    opp = WHITE if color == BLACK else BLACK
+    shaping = 0.0
+
+    # 1. Capture reward: stones captured by color this move.
+    captured_this_move = cap_after[color] - cap_before[color]
+    shaping += _CAPTURE_REWARD * captured_this_move
+
+    # 2. Loss penalty: own stones captured by opponent this move.
+    opp_captured_this_move = cap_after[opp] - cap_before[opp]
+    shaping -= _LOSS_PENALTY * opp_captured_this_move
+
+    # 3. Eye formation bonus: own groups that newly have 2 real eyes.
+    newly_alive = sum(
+        1 for cells, n_eyes in groups_after.items()
+        if n_eyes >= 2
+        and any(board_after[r][c] == color for r, c in cells)
+        and groups_before.get(cells, 0) < 2
+    )
+    shaping += _EYE_BONUS * newly_alive
+
+    # 4. Group death penalty: own groups that existed before but are gone now.
+    for cells, _ in groups_before.items():
+        rep = next(iter(cells))
+        if board_before[rep[0]][rep[1]] != color:
+            continue
+        if not any(board_after[r][c] == color for r, c in cells):
+            shaping -= _GROUP_DEATH_PENALTY
+
+    # 5. Star point bonus: claimed a hoshi this move.
+    if move is not None and move in _STAR_POSITIONS:
+        shaping += _STAR_BONUS
+
+    # 6. Purposeless move penalty.
+    if move is not None:
+        legal_singleton = [move]
+        purposeless = _get_purposeless_moves(board_before, color, legal_singleton)
+        if move in purposeless:
+            shaping -= _PURPOSELESS_PEN
+
+    return float(np.clip(shaping, -1.0, 1.0))
 
 Example = Tuple[np.ndarray, np.ndarray, float]
 # (board_planes: (10,9,9), policy_target: (81,), value_target: ±1)
@@ -111,7 +192,10 @@ def _augment_examples(examples: List[Example]) -> List[Example]:
 def generate_self_play_game(
     ai: MCTS,
     temp_cutoff: int = 12,
-    max_moves: int = 200,
+    max_moves: int = 120,
+    shaping_weight: float = 0.25,
+    resign_threshold: float = -0.9,
+    resign_min_moves: int = 30,
 ) -> List[Example]:
     """
     Play one game, collecting (state, policy, outcome) per move.
@@ -119,9 +203,25 @@ def generate_self_play_game(
     Temperature schedule:
       - moves 0..temp_cutoff-1 : temperature=1  (explore, stochastic)
       - moves temp_cutoff+      : temperature=0  (exploit, near-deterministic)
+
+    Value target = (1 - shaping_weight) * final_outcome
+                 + shaping_weight * per_move_shaping
+
+    shaping_weight controls how much intermediate rewards influence the value
+    target vs. the final game result.  0 = pure outcome (AlphaZero); 1 = pure
+    shaping.  Default 0.25 gives a light shaping signal while keeping the
+    game result dominant.
+
+    resign_threshold: if the NN value estimate (current player's perspective)
+      drops below this, the current player resigns immediately.
+      -0.9 ≈ 5% win probability.  Set to -1.0 to disable.
+    resign_min_moves: don't allow resignation before this many half-moves
+      (gives both sides time to establish a position).
     """
     engine = GoEngine()
-    history: List[Tuple[np.ndarray, np.ndarray, int]] = []
+    # history: (planes, policy, player, shaping_reward)
+    history: List[Tuple[np.ndarray, np.ndarray, int, float]] = []
+    resigned_loser: Optional[int] = None
 
     for move_num in range(max_moves):
         if engine.game_over:
@@ -130,6 +230,16 @@ def generate_self_play_game(
             engine.pass_move()
             break
 
+        # Resign check: single fast NN eval, no MCTS tree.
+        # Only after resign_min_moves so neither side quits in the opening.
+        if move_num >= resign_min_moves and resign_threshold > -1.0:
+            with torch.inference_mode():
+                t = encode_board(engine).unsqueeze(0).to(ai.device)
+                _, v = ai.model(t)
+            if float(v.item()) < resign_threshold:
+                resigned_loser = engine.current_player
+                break
+
         temperature = 1.0 if move_num < temp_cutoff else 0.0
         probs = ai.get_move_probabilities(engine, temperature=temperature)
 
@@ -137,22 +247,60 @@ def generate_self_play_game(
         for (r, c), p in probs.items():
             policy[r * BOARD_SIZE + c] = p
 
-        history.append((encode_board(engine).numpy(), policy, engine.current_player))
+        # Snapshot state before the move for shaping computation.
+        board_before  = [row[:] for row in engine.board]
+        cap_before    = dict(engine.captured)
+        groups_before = _snapshot_groups(board_before)
+        player        = engine.current_player
 
-        moves   = list(probs.keys())
-        weights = [probs[m] for m in moves]
-        engine.play(*random.choices(moves, weights=weights, k=1)[0])
+        # Choose and play the move.
+        moves = list(probs.keys())
+        if not moves:
+            history.append((encode_board(engine).numpy(), policy, player, 0.0))
+            engine.pass_move()
+            continue
+        weights  = [probs[m] for m in moves]
+        chosen   = random.choices(moves, weights=weights, k=1)[0]
 
-    score      = engine.get_score()
-    score_diff = score["black_score"] - score["white_score"]   # + = Black ahead
+        history.append((encode_board(engine).numpy(), policy, player, None))  # shaping filled below
 
-    return [
-        (planes, policy, float(np.clip(
+        engine.play(*chosen)
+
+        # Compute shaping reward for the move just played.
+        board_after   = engine.board
+        cap_after     = dict(engine.captured)
+        groups_after  = _snapshot_groups(board_after)
+        shaping = _compute_shaping(
+            board_before, board_after, chosen, player,
+            cap_before, cap_after, groups_before, groups_after,
+        )
+        # Replace the placeholder shaping value.
+        planes, pol, pl, _ = history[-1]
+        history[-1] = (planes, pol, pl, shaping)
+
+    if resigned_loser is not None:
+        # Resigned player loses by the maximum margin (_SCORE_NORM points).
+        score_diff = -_SCORE_NORM if resigned_loser == BLACK else _SCORE_NORM
+    else:
+        score      = engine.get_score()
+        score_diff = score["black_score"] - score["white_score"]
+
+    examples: List[Example] = []
+    for planes, policy, player, shaping in history:
+        final_outcome = float(np.clip(
             (1.0 if player == BLACK else -1.0) * score_diff / _SCORE_NORM,
             -1.0, 1.0,
-        )))
-        for planes, policy, player in history
-    ]
+        ))
+        if shaping is None:
+            shaping = 0.0
+        # Blend final outcome with per-move shaping.
+        value = float(np.clip(
+            (1.0 - shaping_weight) * final_outcome + shaping_weight * shaping,
+            -1.0, 1.0,
+        ))
+        examples.append((planes, policy, value))
+
+    return examples
 
 
 # ---------------------------------------------------------------------------
@@ -161,11 +309,13 @@ def generate_self_play_game(
 
 def _worker_generate_game(args: Tuple) -> List[Example]:
     """Subprocess entry: generate one self-play game with a fresh model copy."""
-    state_dict, sims, temp_cutoff = args
+    state_dict, sims, temp_cutoff, max_moves, resign_threshold = args
     model = GoNet()
     model.load_state_dict(state_dict)
     ai = MCTS(model, num_simulations=sims, device="cpu", training=True)
-    return generate_self_play_game(ai, temp_cutoff=temp_cutoff)
+    return generate_self_play_game(ai, temp_cutoff=temp_cutoff,
+                                   max_moves=max_moves,
+                                   resign_threshold=resign_threshold)
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +338,9 @@ def run_self_play(
     steps_per_game: int = 4,
     augment: bool = True,
     use_compile: bool = False,
+    shaping_weight: float = 0.25,
+    max_moves: int = 120,
+    resign_threshold: float = -0.9,
 ) -> None:
     device = "cpu"
     if torch.cuda.is_available():
@@ -236,11 +389,14 @@ def run_self_play(
         if n_this > 1:
             # Parallel generation: snapshot model weights to CPU for workers
             cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
-            args = [(cpu_state, sims_per_move, temp_cutoff)] * n_this
+            args = [(cpu_state, sims_per_move, temp_cutoff, max_moves, resign_threshold)] * n_this
             with ctx.Pool(n_this) as pool:
                 game_batch = pool.map(_worker_generate_game, args)
         else:
-            game_batch = [generate_self_play_game(ai, temp_cutoff=temp_cutoff)]
+            game_batch = [generate_self_play_game(ai, temp_cutoff=temp_cutoff,
+                                                   shaping_weight=shaping_weight,
+                                                   max_moves=max_moves,
+                                                   resign_threshold=resign_threshold)]
 
         elapsed = time.time() - t0
 
@@ -491,7 +647,13 @@ def main() -> None:
                     help="Disable 8-fold board symmetry augmentation")
     sp.add_argument("--compile",        action="store_true",
                     help="torch.compile the model (PyTorch 2+ only)")
-    sp.add_argument("--model",          type=str,   default=None)
+    sp.add_argument("--shaping-weight", type=float, default=0.25,
+                    help="Weight of per-move shaping vs final outcome (0=pure outcome, 1=pure shaping)")
+    sp.add_argument("--max-moves",        type=int,   default=120,
+                    help="Force score settlement after this many moves per game (default 120)")
+    sp.add_argument("--resign-threshold", type=float, default=-0.9,
+                    help="Resign when NN value < this (default -0.9 ≈ 5%% win rate); -1 to disable")
+    sp.add_argument("--model",            type=str,   default=None)
     sp.add_argument("--out",            type=str,   default="model.pt")
 
     sg = sub.add_parser("sgf")
@@ -524,6 +686,9 @@ def main() -> None:
             steps_per_game=args.steps_per_game,
             augment=not args.no_augment,
             use_compile=args.compile,
+            shaping_weight=args.shaping_weight,
+            max_moves=args.max_moves,
+            resign_threshold=args.resign_threshold,
         )
     elif args.cmd == "sgf":
         run_sgf_training(

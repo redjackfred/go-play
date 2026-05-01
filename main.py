@@ -59,7 +59,7 @@ def _play_game(
     ai_black: MCTS,
     ai_white: MCTS,
     verbose: bool = True,
-    max_moves: int = BOARD_SIZE * BOARD_SIZE * 2,
+    max_moves: int = 120,
 ) -> int:
     """Play one complete game.  Returns winner (BLACK or WHITE)."""
     engine = GoEngine()
@@ -73,8 +73,10 @@ def _play_game(
         move_number += 1
 
         if verbose:
-            print(f"Move {move_number:3d}  {player_name[engine.current_player]}: "
-                  f"{_move_str(move)}")
+            print(
+                f"Move {move_number:3d}  {player_name[engine.current_player]}: "
+                f"{_move_str(move)}"
+            )
 
         if ai.check_resign(engine):
             engine.resign()
@@ -114,9 +116,11 @@ def _play_game(
 # CLI modes
 # ---------------------------------------------------------------------------
 
+
 def run_gui(sims: int, model_path: Optional[str] = None) -> None:
     try:
         import gui
+
         gui.run(num_simulations=sims, model_path=model_path)
     except ImportError as e:
         print(f"GUI unavailable: {e}")
@@ -144,39 +148,43 @@ def run_perft(sims: int, n_games: int, model_path: Optional[str] = None) -> None
         winner = _play_game(ai, ai, verbose=False)
         wins[winner] += 1
         elapsed = time.time() - t0
-        print(f"  Game {i+1:3d}  winner={'Black' if winner==BLACK else 'White'}"
-              f"  B:{wins[BLACK]}  W:{wins[WHITE]}"
-              f"  elapsed={elapsed:.1f}s")
+        print(
+            f"  Game {i + 1:3d}  winner={'Black' if winner == BLACK else 'White'}"
+            f"  B:{wins[BLACK]}  W:{wins[WHITE]}"
+            f"  elapsed={elapsed:.1f}s"
+        )
 
     total = wins[BLACK] + wins[WHITE]
     print(f"\nResults over {total} games:")
-    print(f"  Black wins: {wins[BLACK]} ({100*wins[BLACK]/total:.1f}%)")
-    print(f"  White wins: {wins[WHITE]} ({100*wins[WHITE]/total:.1f}%)")
+    print(f"  Black wins: {wins[BLACK]} ({100 * wins[BLACK] / total:.1f}%)")
+    print(f"  White wins: {wins[WHITE]} ({100 * wins[WHITE] / total:.1f}%)")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="9x9 Go engine with MCTS+NN AI"
+    parser = argparse.ArgumentParser(description="9x9 Go engine with MCTS+NN AI")
+    parser.add_argument(
+        "--selfplay", action="store_true", help="Run one AI vs AI game on the console"
     )
     parser.add_argument(
-        "--selfplay", action="store_true",
-        help="Run one AI vs AI game on the console"
+        "--perft",
+        type=int,
+        metavar="N",
+        default=0,
+        help="Run N AI self-play games and print win statistics",
     )
     parser.add_argument(
-        "--perft", type=int, metavar="N", default=0,
-        help="Run N AI self-play games and print win statistics"
+        "--sims", type=int, default=200, help="MCTS simulations per move (default 200)"
     )
     parser.add_argument(
-        "--sims", type=int, default=200,
-        help="MCTS simulations per move (default 200)"
-    )
-    parser.add_argument(
-        "--model", type=str, default=None,
-        help="Path to trained model weights (e.g. model_v3.pt)"
+        "--model",
+        type=str,
+        default=None,
+        help="Path to trained model weights (e.g. model_v3.pt)",
     )
     args = parser.parse_args()
 

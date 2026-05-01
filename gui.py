@@ -121,7 +121,7 @@ def draw_coord_labels(surf, font):
         l = font.render(letters[i], True, C_TEXT)
         surf.blit(l, (cx - l.get_width()//2, MARGIN - CELL//2 - l.get_height() - 2))
         _, ry = _cell_to_px(i, 0)
-        r = font.render(str(i), True, C_TEXT)
+        r = font.render(str(BOARD_SIZE - i), True, C_TEXT)
         surf.blit(r, (MARGIN - CELL//2 - r.get_width() - 4, ry - r.get_height()//2))
 
 

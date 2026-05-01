@@ -73,7 +73,7 @@ EMPTY = 0
 BLACK = 1
 WHITE = 2
 BOARD_SIZE = 9
-KOMI = 6.5
+KOMI = 2.5
 
 
 def opponent(color: int) -> int:

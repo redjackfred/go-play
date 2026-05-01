@@ -33,22 +33,13 @@
 #      multiplicative prior shaping (spatial / eye / capture / escape /
 #      connection-penalty) layered on top of the network policy.
 #
-# Move-selection priority order in `select_move` (gameplay mode only;
-# in training mode steps 1–3 are skipped so the search distribution
-# stays unbiased):
-#
-#   1. Capture: if any legal move captures an opponent group in atari,
-#      take the smallest such move immediately.
-#   2. Forced atari escape: if exactly one of our groups in atari can be
-#      saved by exactly one move, AND that escape is not futile (a
-#      one-step lookahead shows it gains real liberties), play it.
-#   3. Opening 3-3 corner points: while we have fewer than four stones
-#      on the board, claim 3-3 corners in a fixed order, skipping any
-#      that would fill an own eye.
-#   4. MCTS: run num_simulations PUCT rollouts and pick the child with
-#      the most visits (the AlphaZero standard). The pass move is a
-#      special child handled separately — see `_create_children` for
-#      the training-vs-gameplay difference.
+# Move selection in `select_move`:
+#   All moves go through MCTS (num_simulations PUCT rollouts).  Tactical
+#   knowledge (captures, atari threats, escapes, eye formation, etc.) is
+#   injected via multiplicative prior biases in `_create_children` so the
+#   search naturally prefers strong moves without bypassing the tree.
+#   The pass move is a special child handled separately — see `_create_children`
+#   for the training-vs-gameplay difference.
 
 from __future__ import annotations
 
@@ -67,7 +58,7 @@ from board import BLACK, BOARD_SIZE, EMPTY, WHITE, GoEngine, opponent
 # Spatial prior heatmap  (金角銀邊草肚皮 + 3rd/4th line preference)
 # ---------------------------------------------------------------------------
 
-_LINE_SCORES = [0.35, 0.75, 1.70, 1.40, 0.55]
+_LINE_SCORES = [0.35, 0.75, 1.45, 1.80, 0.60]
 
 
 def _make_spatial_prior(size: int) -> np.ndarray:
@@ -84,9 +75,13 @@ def _make_spatial_prior(size: int) -> np.ndarray:
 
 _SPATIAL_PRIOR: np.ndarray = _make_spatial_prior(BOARD_SIZE)
 
-# Opening priorities: claim all four 3-3 corner points before switching to MCTS.
-# Order: top-left → bottom-right (diagonal) → top-right → bottom-left.
-_OPENING_PRIORITIES: List[Tuple[int, int]] = [(2, 2), (6, 6), (2, 6), (6, 2)]
+# Opening priorities: tengen (天元) first, then the four 4-4 star points (星位).
+# 4-4 (0-indexed: 3,3) radiates more influence than 3-3 and is the standard
+# high-Chinese opening on 9x9.  3-4 (小目) points (2,3)/(3,2) also rank well
+# via the spatial prior (4th-line score > 3rd-line score).
+_TENGEN: Tuple[int, int] = (4, 4)
+_OPENING_CORNERS: List[Tuple[int, int]] = [(3, 3), (5, 5), (3, 5), (5, 3)]
+_OPENING_PRIORITIES: List[Tuple[int, int]] = [_TENGEN] + _OPENING_CORNERS
 
 # ---------------------------------------------------------------------------
 # Valid in-bounds neighbor count per cell — precomputed once for eye detection
@@ -137,6 +132,171 @@ def _is_own_eye(
             if board[nr][nc] != color:
                 return False
     return True
+
+
+def _is_real_eye(board: List[List[int]], r: int, c: int, color: int) -> bool:
+    """True if (r,c) is a real (true) eye (真眼) for `color`.
+
+    Extends _is_own_eye with the diagonal condition:
+      · Interior cell (all 4 orthogonal in-bounds): at most 1 bad diagonal allowed.
+      · Edge/corner cell: 0 bad diagonals allowed.
+    This separates false eyes (虛眼) from real eyes (真眼) that actually
+    contribute to group life.
+    """
+    if not _is_own_eye(board, r, c, color):
+        return False
+    opp = WHITE if color == BLACK else BLACK
+    interior = 0 < r < BOARD_SIZE - 1 and 0 < c < BOARD_SIZE - 1
+    bad = sum(
+        1 for dr, dc in ((-1, -1), (-1, 1), (1, -1), (1, 1))
+        if (0 <= r + dr < BOARD_SIZE and 0 <= c + dc < BOARD_SIZE
+            and board[r + dr][c + dc] == opp)
+    )
+    return bad <= (1 if interior else 0)
+
+
+def _count_group_real_eyes(
+    board: List[List[int]], liberties: set, color: int
+) -> int:
+    """Count enclosed eye spaces (真眼空間) for a group.
+
+    Step 1 — find "interior" liberties: cells where EVERY in-bounds orthogonal
+      neighbor is either an own stone or another liberty of this group.
+      Exterior liberties (adjacent to open empty cells) are excluded.
+
+    Step 2 — find connected components of interior liberties.  Each component
+      is one enclosed eye space:
+        · Single-cell component: applies the diagonal real-eye condition.
+        · Multi-cell component: always counts as 1 eye (大眼).
+
+    This correctly handles single-cell eyes, large enclosed areas, and avoids
+    false positives from exterior liberties that open to the rest of the board.
+    """
+    opp = WHITE if color == BLACK else BLACK
+
+    interior: set = set()
+    for r, c in liberties:
+        enclosed = True
+        for dr, dc in _NEIGHBORS:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                continue  # board edge is a wall — OK
+            nb = board[nr][nc]
+            if nb == EMPTY and (nr, nc) not in liberties:
+                enclosed = False  # open empty cell outside group → not enclosed
+                break
+            if nb == opp:
+                enclosed = False  # opponent stone borders this cell → not an eye
+                break
+        if enclosed:
+            interior.add((r, c))
+
+    eye_count = 0
+    visited: set = set()
+    for start in interior:
+        if start in visited:
+            continue
+        region: set = set()
+        stack = [start]
+        while stack:
+            cell = stack.pop()
+            if cell in region:
+                continue
+            region.add(cell)
+            r, c = cell
+            for dr, dc in _NEIGHBORS:
+                nb_cell = (r + dr, c + dc)
+                if nb_cell in interior and nb_cell not in region:
+                    stack.append(nb_cell)
+        visited |= region
+        if len(region) == 1:
+            r, c = next(iter(region))
+            if _is_real_eye(board, r, c, color):
+                eye_count += 1
+        else:
+            eye_count += 1  # multi-cell enclosed region = 1 eye space
+    return eye_count
+
+
+def _get_life_urgency_moves(
+    board: List[List[int]], color: int
+) -> Dict[Tuple[int, int], float]:
+    """Return {move: multiplier} boosting moves that help own groups with < 2 real eyes.
+
+    For each own group with fewer than 2 real eyes (真眼), boost:
+      · its liberties (direct expansion / natural eye-forming spots)
+      · empty cells adjacent to those liberties (wider eye-space growth)
+    Groups with 0 eyes get a stronger multiplier (2.0) than groups with 1 eye (1.5).
+    """
+    result: Dict[Tuple[int, int], float] = {}
+    for stone, _group, liberties in _iter_groups(board):
+        if stone != color:
+            continue
+        n_eyes = _count_group_real_eyes(board, liberties, color)
+        if n_eyes >= 2:
+            continue
+        mult = 2.0 if n_eyes == 0 else 1.5
+        for lib in liberties:
+            if result.get(lib, 0.0) < mult:
+                result[lib] = mult
+        for r, c in liberties:
+            for dr, dc in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                if (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE
+                        and board[nr][nc] == EMPTY and (nr, nc) not in liberties):
+                    edge_mult = mult * 0.65
+                    if result.get((nr, nc), 0.0) < edge_mult:
+                        result[(nr, nc)] = edge_mult
+    return result
+
+
+def _get_eye_attack_moves(
+    board: List[List[int]], color: int
+) -> Dict[Tuple[int, int], float]:
+    """Return {move: multiplier} for moves that attack opponent groups with < 2 real eyes.
+
+    This is the offensive mirror of _get_life_urgency_moves: for each opponent
+    group that hasn't yet secured two real eyes, we identify the moves that
+    invade or constrain their eye-forming space, potentially making them dead.
+
+    Priority tiers:
+      · Direct liberty invasion (佔眼位): opponent's liberties that are also
+        candidate eye spaces.  Highest multiplier — playing here directly
+        reduces the eye space available to the opponent.
+      · Adjacent pressure (縮眼空): empty cells next to those liberties.
+        Secondary multiplier — narrows the region, making two-eye life harder.
+
+    Opponent groups with 0 eyes are the most urgent targets (mult=2.0);
+    groups with 1 eye are still valuable to attack before they stabilise (mult=1.5).
+    """
+    opp = WHITE if color == BLACK else BLACK
+    result: Dict[Tuple[int, int], float] = {}
+
+    for stone, _group, liberties in _iter_groups(board):
+        if stone != opp:
+            continue
+        n_eyes = _count_group_real_eyes(board, liberties, opp)
+        if n_eyes >= 2:
+            continue  # already alive — not worth attacking here
+
+        mult = 2.0 if n_eyes == 0 else 1.5
+
+        # Direct invasion: occupy the opponent's potential eye spaces.
+        for lib in liberties:
+            if result.get(lib, 0.0) < mult:
+                result[lib] = mult
+
+        # Adjacent pressure: shrink the eye-forming region from the outside.
+        for r, c in liberties:
+            for dr, dc in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                if (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE
+                        and board[nr][nc] == EMPTY and (nr, nc) not in liberties):
+                    edge_mult = mult * 0.65
+                    if result.get((nr, nc), 0.0) < edge_mult:
+                        result[(nr, nc)] = edge_mult
+
+    return result
 
 
 def _iter_groups(board: List[List[int]]):
@@ -215,22 +375,124 @@ def _find_dead_zone_cells(
 def _is_wasteful_connection(
     board: List[List[int]], r: int, c: int, color: int
 ) -> bool:
-    """Return True if placing `color` at (r,c) merely connects already-adjacent own stones
-    with no opponent pressure nearby.
+    """Return True if placing `color` at (r,c) merely connects already-strong own groups.
 
-    Heuristic: ≥2 orthogonal own-stone neighbors AND 0 opponent neighbors.
-    Connections under pressure (any opponent neighbor) are NOT penalised.
+    A connection is wasteful only when ALL adjacent own groups have > 3 liberties
+    (already strong, no need for reinforcement) AND no opponent pressure nearby.
+    Connecting two weak groups is legitimate — they share liberties and become
+    harder to kill (連接只能為了讓兩個有弱點的棋連起來變強).
     """
     opp = WHITE if color == BLACK else BLACK
-    own_adj = opp_adj = 0
+    own_adj_starts: List[Tuple[int, int]] = []
+    opp_adj = 0
     for dr, dc in _NEIGHBORS:
         nr, nc = r + dr, c + dc
         if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
             if board[nr][nc] == color:
-                own_adj += 1
+                own_adj_starts.append((nr, nc))
             elif board[nr][nc] == opp:
                 opp_adj += 1
-    return own_adj >= 2 and opp_adj == 0
+    if len(own_adj_starts) < 2 or opp_adj > 0:
+        return False
+    # Check each adjacent own group's liberty count — exempt if any group is weak (≤ 3 libs)
+    visited: set = set()
+    for start in own_adj_starts:
+        if start in visited:
+            continue
+        group: set = set()
+        libs: set = set()
+        stack = [start]
+        while stack:
+            rr, cc = stack.pop()
+            if (rr, cc) in group:
+                continue
+            group.add((rr, cc))
+            for ddr, ddc in _NEIGHBORS:
+                nr, nc = rr + ddr, cc + ddc
+                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
+                    nb = board[nr][nc]
+                    if nb == color and (nr, nc) not in group:
+                        stack.append((nr, nc))
+                    elif nb == EMPTY:
+                        libs.add((nr, nc))
+        visited |= group
+        if len(libs) <= 3:
+            return False  # weak group — connecting is justified
+    return True  # all adjacent groups are strong — connection is wasteful
+
+
+_STAR_POSITIONS: frozenset[Tuple[int, int]] = frozenset(
+    [(4, 4), (3, 3), (5, 5), (3, 5), (5, 3)]
+)
+
+
+def _get_star_defense_moves(
+    engine: GoEngine, color: int
+) -> List[Tuple[int, int]]:
+    """Return defensive moves for own star-position stones under threat.
+
+    A star-position stone is "threatened" when our group containing it has
+    ≤ 3 liberties AND at least one opponent stone is orthogonally adjacent
+    to any stone in that group.  We return the group's liberties as candidate
+    defense moves, sorted by how many liberties playing there would add
+    (most-liberating first).
+    """
+    board = engine.board
+    opp = WHITE if color == BLACK else BLACK
+    candidates: List[Tuple[int, int]] = []
+    seen_groups: set[Tuple[int, int]] = set()
+
+    for star_r, star_c in _STAR_POSITIONS:
+        if board[star_r][star_c] != color:
+            continue
+        if (star_r, star_c) in seen_groups:
+            continue
+
+        group: set[Tuple[int, int]] = set()
+        liberties: set[Tuple[int, int]] = set()
+        stack = [(star_r, star_c)]
+        while stack:
+            rr, cc = stack.pop()
+            if (rr, cc) in group:
+                continue
+            group.add((rr, cc))
+            for dr, dc in _NEIGHBORS:
+                nr, nc = rr + dr, cc + dc
+                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
+                    if board[nr][nc] == color and (nr, nc) not in group:
+                        stack.append((nr, nc))
+                    elif board[nr][nc] == EMPTY:
+                        liberties.add((nr, nc))
+        seen_groups |= group
+
+        if len(liberties) > 3:
+            continue  # group still comfortable — not threatened
+
+        opp_adjacent = any(
+            board[rr + dr][cc + dc] == opp
+            for rr, cc in group
+            for dr, dc in _NEIGHBORS
+            if 0 <= rr + dr < BOARD_SIZE and 0 <= cc + dc < BOARD_SIZE
+        )
+        if not opp_adjacent:
+            continue  # no direct opponent pressure yet
+
+        legal_libs = [m for m in liberties if engine.is_legal(*m)]
+        if not legal_libs:
+            continue
+
+        # Sort: prefer liberty moves that give the group more breathing room.
+        def _lib_gain(move: Tuple[int, int]) -> int:
+            sim = engine.clone()
+            if not sim.play(*move):
+                return 0
+            _, new_libs = sim._get_group(*move)
+            return len(new_libs)
+
+        legal_libs.sort(key=_lib_gain, reverse=True)
+        candidates.extend(legal_libs)
+
+    return candidates
 
 
 def _escape_is_futile(engine: GoEngine, move: Tuple[int, int]) -> bool:
@@ -250,6 +512,51 @@ def _escape_is_futile(engine: GoEngine, move: Tuple[int, int]) -> bool:
         return False  # gained ≥2 liberties — escape has real value
     lib = next(iter(liberties))
     return sim.is_legal(*lib)  # opponent can legally snap back → futile
+
+
+def _atari_threat_is_safe(engine: GoEngine, move: Tuple[int, int]) -> bool:
+    """Return True if playing an atari threat at `move` doesn't endanger own groups.
+
+    Uses a full one-step simulation (so captures are handled correctly) and
+    checks two conditions:
+
+      1. The placed stone's group has ≥ 2 liberties after the move.
+         (Catches self-atari even when a capture opens temporary liberties.)
+
+      2. No own group that was previously safe (≥ 2 liberties) drops to
+         ≤ 1 liberty — i.e., the move doesn't indirectly weaken another
+         own group that the opponent could then capture immediately.
+    """
+    color = engine.current_player
+    r, c = move
+
+    # Record which own cells belonged to safe groups before the move.
+    safe_cells_before: set[Tuple[int, int]] = {
+        cell
+        for stone, group, libs in _iter_groups(engine.board)
+        if stone == color and len(libs) >= 2
+        for cell in group
+    }
+
+    # Simulate (captures resolved by engine).
+    sim = engine.clone()
+    if not sim.play(r, c):
+        return False
+
+    # Condition 1: placed stone's group must have ≥ 2 liberties.
+    if sim.board[r][c] == color:            # stone wasn't captured itself
+        _, placed_libs = sim._get_group(r, c)
+        if len(placed_libs) <= 1:
+            return False
+
+    # Condition 2: no previously-safe group may now be in atari.
+    for stone, group, libs in _iter_groups(sim.board):
+        if stone != color or len(libs) > 1:
+            continue
+        if any(cell in safe_cells_before for cell in group):
+            return False
+
+    return True
 
 
 def _get_tactical_moves(
@@ -335,6 +642,26 @@ def _get_capture_move_sizes(
         lib = next(iter(liberties))
         sizes[lib] = sizes.get(lib, 0) + len(group)
     return sizes
+
+
+def _get_atari_threat_moves(
+    board: List[List[int]], color: int
+) -> Dict[Tuple[int, int], int]:
+    """Return {move: group_size} for moves that put an opponent group in atari (叫吃).
+
+    Only groups with exactly 2 liberties qualify — playing at either liberty
+    reduces the group to 1 liberty (atari).  When a liberty is shared by
+    multiple 2-liberty groups the sizes are summed, rewarding moves that
+    simultaneously threaten several groups.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    threats: Dict[Tuple[int, int], int] = {}
+    for stone, group, liberties in _iter_groups(board):
+        if stone != opp or len(liberties) != 2:
+            continue
+        for lib in liberties:
+            threats[lib] = threats.get(lib, 0) + len(group)
+    return threats
 
 
 def _nakade_vital_points(
@@ -504,6 +831,86 @@ def _eye_score(
             opp_denied += 1
 
     return own_created, opp_denied
+
+
+def _get_purposeless_moves(
+    board: List[List[int]], color: int, legal: List[Tuple[int, int]],
+    radius: int = 3,
+) -> set[Tuple[int, int]]:
+    """Return moves that accomplish nothing locally (無意義手).
+
+    A move is purposeless when ALL of the following hold:
+      1. No opponent stone within Manhattan distance `radius`.
+      2. No own group with ≤ 3 liberties within `radius`.
+      3. Placing there creates no eye for us (own_eye_score == 0).
+      4. No adjacent empty cell sits on the boundary between own and opponent
+         influence (so the move doesn't contest any future territory).
+
+    Such moves don't attack, don't defend, don't build eyes, and don't claim
+    territory — they waste the initiative entirely.
+    """
+    opp = WHITE if color == BLACK else BLACK
+
+    # Precompute which cells belong to own weak groups (≤ 3 liberties).
+    weak_own: set[Tuple[int, int]] = set()
+    for stone, group, liberties in _iter_groups(board):
+        if stone == color and len(liberties) <= 3:
+            weak_own |= group
+
+    purposeless: set[Tuple[int, int]] = set()
+    for r, c in legal:
+        # --- Conditions 1 & 2: neighbourhood scan ---
+        has_opp = False
+        has_weak_own = False
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if abs(dr) + abs(dc) > radius:
+                    continue
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                    continue
+                if board[nr][nc] == opp:
+                    has_opp = True
+                if (nr, nc) in weak_own:
+                    has_weak_own = True
+            if has_opp and has_weak_own:
+                break
+        if has_opp or has_weak_own:
+            continue
+
+        # --- Condition 3: eye contribution ---
+        own_eye, _ = _eye_score(board, r, c, color)
+        if own_eye > 0:
+            continue
+
+        # --- Condition 4: territory contest ---
+        # An adjacent empty cell that borders BOTH a own stone and an opponent
+        # stone is a contested frontier — playing nearby has territorial meaning.
+        on_frontier = False
+        for dr, dc in _NEIGHBORS:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                continue
+            if board[nr][nc] != EMPTY:
+                continue
+            adj_has_own = adj_has_opp = False
+            for ddr, ddc in _NEIGHBORS:
+                nnr, nnc = nr + ddr, nc + ddc
+                if not (0 <= nnr < BOARD_SIZE and 0 <= nnc < BOARD_SIZE):
+                    continue
+                if board[nnr][nnc] == color:
+                    adj_has_own = True
+                elif board[nnr][nnc] == opp:
+                    adj_has_opp = True
+            if adj_has_own and adj_has_opp:
+                on_frontier = True
+                break
+        if on_frontier:
+            continue
+
+        purposeless.add((r, c))
+
+    return purposeless
 
 
 def encode_board(
@@ -865,6 +1272,167 @@ def _is_ko_active(
     return diff == 2
 
 
+def _get_dual_purpose_attack_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Empty cells that both pressure a weak opponent group AND extend own position.
+
+    Qualifies when the cell is a liberty of an opponent group with 2–3 liberties
+    (under pressure but not yet in atari — that case is already handled by
+    capture_bias / atari_escape_bias) AND is orthogonally adjacent to at least
+    one own stone.  Playing there tightens the net while physically connecting
+    to / extending our own formation — 攻守兼備.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    attack_cells: set = set()
+    for stone, _group, libs in _iter_groups(board):
+        if stone == opp and 2 <= len(libs) <= 3:
+            attack_cells |= libs
+
+    result: set = set()
+    for r, c in attack_cells:
+        if board[r][c] != EMPTY:
+            continue
+        for dr, dc in _NEIGHBORS:
+            nr, nc = r + dr, c + dc
+            if (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE
+                    and board[nr][nc] == color):
+                result.add((r, c))
+                break
+    return result
+
+
+def _creates_self_atari(
+    board: List[List[int]], r: int, c: int, color: int
+) -> bool:
+    """Return True if placing color at (r,c) leaves the resulting group with exactly 1 liberty.
+
+    Uses a flood-fill from (r,c) treating it as already placed.  Callers should
+    exempt capture moves, since capturing an opponent group in atari is legal and
+    desirable even if the new stone temporarily has 1 liberty.
+    """
+    liberties: set = set()
+    visited: set = {(r, c)}
+    stack = [(r, c)]
+    while stack:
+        rr, cc = stack.pop()
+        for dr, dc in _NEIGHBORS:
+            nr, nc = rr + dr, cc + dc
+            if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                continue
+            if (nr, nc) in visited:
+                continue
+            nb = board[nr][nc]
+            if nb == EMPTY:
+                liberties.add((nr, nc))
+            elif nb == color:
+                visited.add((nr, nc))
+                stack.append((nr, nc))
+    return len(liberties) == 1
+
+
+def _get_corner_consolidation_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells in corner regions where `color` already has stones.
+
+    Corner region = 4×4 quadrant at each board corner.  When we have a
+    foothold there we should deepen it to secure two eyes before the opponent
+    can invade.  Only corners that already contain at least one own stone are
+    returned — we are consolidating, not invading from scratch.
+    """
+    CORNER_RADIUS = 4
+    result: set = set()
+    starts = [0, BOARD_SIZE - CORNER_RADIUS]
+    for r0 in starts:
+        for c0 in starts:
+            rows = range(r0, r0 + CORNER_RADIUS)
+            cols = range(c0, c0 + CORNER_RADIUS)
+            if not any(board[r][c] == color for r in rows for c in cols):
+                continue
+            for r in rows:
+                for c in cols:
+                    if board[r][c] == EMPTY:
+                        result.add((r, c))
+    return result
+
+
+def _get_jump_connection_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells that are efficient jump (一間跳) bridges between own stones.
+
+    A one-point jump target T qualifies when:
+      · T is two orthogonal steps from an own stone S with the intermediate
+        cell empty (classic 一間跳 shape), AND
+      · T has at least one other own stone as an orthogonal or diagonal
+        neighbour (making T a bridge between two separate stone clusters).
+
+    Jump connections are harder for the opponent to cut than solid chains and
+    more efficient than passing — prefer them when linking own positions.
+    """
+    result: set = set()
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != color:
+                continue
+            for dr, dc in _NEIGHBORS:
+                mr, mc = r + dr,      c + dc       # midpoint
+                tr, tc = r + 2 * dr, c + 2 * dc   # jump target
+                if not (0 <= mr < BOARD_SIZE and 0 <= mc < BOARD_SIZE):
+                    continue
+                if not (0 <= tr < BOARD_SIZE and 0 <= tc < BOARD_SIZE):
+                    continue
+                if board[mr][mc] != EMPTY or board[tr][tc] != EMPTY:
+                    continue
+                # Check if target is near another own stone (orth or diag)
+                bridged = False
+                for dr2, dc2 in _NEIGHBORS:
+                    nr, nc = tr + dr2, tc + dc2
+                    if (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE
+                            and board[nr][nc] == color and (nr, nc) != (r, c)):
+                        bridged = True
+                        break
+                if not bridged:
+                    for dr2, dc2 in ((-1, -1), (-1, 1), (1, -1), (1, 1)):
+                        nr, nc = tr + dr2, tc + dc2
+                        if (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE
+                                and board[nr][nc] == color and (nr, nc) != (r, c)):
+                            bridged = True
+                            break
+                if bridged:
+                    result.add((tr, tc))
+    return result
+
+
+def _get_nobi_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells that extend own stone chains by one step (長/nobi).
+
+    A nobi qualifies when the cell is adjacent to exactly one own stone and
+    no opponent stones — pure directional extension, not a connection.
+    Moves adjacent to opponent stones are already covered by tactical biases.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    result: set = set()
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != EMPTY:
+                continue
+            own_adj = opp_adj = 0
+            for dr, dc in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
+                    if board[nr][nc] == color:
+                        own_adj += 1
+                    elif board[nr][nc] == opp:
+                        opp_adj += 1
+            if own_adj == 1 and opp_adj == 0:
+                result.add((r, c))
+    return result
+
+
 def _get_boundary_moves(
     board: List[List[int]], color: int
 ) -> set:
@@ -1008,6 +1576,269 @@ def _get_pattern_response_moves(
     return responses
 
 
+def _get_kosumi_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells that are diagonal extensions from own stones (小飛/Kosumi).
+
+    A kosumi qualifies when the target cell is diagonally adjacent to an own
+    stone.  We return ALL diagonal extensions (including cuttable ones) because:
+      · On 9x9 the board is small and thick shape is always valuable.
+      · Cuttable kosumi is still a key territory-claiming and connecting tool.
+
+    The caller (_create_children) will apply kosumi_bias as the multiplier.
+    """
+    diagonals = ((-1, -1), (-1, 1), (1, -1), (1, 1))
+    result: set = set()
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != EMPTY:
+                continue
+            for dr, dc in diagonals:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                    continue
+                if board[nr][nc] == color:
+                    result.add((r, c))
+                    break
+    return result
+
+
+def _get_keima_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells a knight's move from own stones (小飛/Keima).
+
+    Keima (1×2 knight's move) is faster than kosumi for enclosure and blocking
+    escape routes.  More aggressive than unarmed diagonal steps but cuttable —
+    used primarily for chasing stones and sealing territory on 9x9.
+    """
+    result: set = set()
+    keima_offsets = ((-2, -1), (-2, 1), (-1, -2), (-1, 2),
+                     (1, -2),  (1, 2),  (2, -1),  (2, 1))
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != EMPTY:
+                continue
+            for dr, dc in keima_offsets:
+                nr, nc = r + dr, c + dc
+                if (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE
+                        and board[nr][nc] == color):
+                    result.add((r, c))
+                    break
+    return result
+
+
+def _get_ikken_tobi_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells reachable by a one-point jump (一間跳) from any own stone.
+
+    A one-point jump: target T is two orthogonal steps from own stone S with
+    the intermediate cell empty.  This covers BOTH:
+      · Pure extension: T has no other own neighbour (expanding into new territory).
+      · Bridge: T connects two separate own clusters (already handled by
+        _get_jump_connection_moves but included here for the unified bias).
+
+    一間跳 is the fastest safe extension — harder to cut than nobi and more
+    efficient than staying adjacent.  It is the primary tool for racing across
+    the board and building influence.
+    """
+    result: set = set()
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != color:
+                continue
+            for dr, dc in _NEIGHBORS:
+                mr, mc = r + dr,      c + dc       # intermediate cell
+                tr, tc = r + 2 * dr, c + 2 * dc   # jump target
+                if not (0 <= mr < BOARD_SIZE and 0 <= mc < BOARD_SIZE):
+                    continue
+                if not (0 <= tr < BOARD_SIZE and 0 <= tc < BOARD_SIZE):
+                    continue
+                if board[mr][mc] == EMPTY and board[tr][tc] == EMPTY:
+                    result.add((tr, tc))
+    return result
+
+
+def _get_tsuke_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells adjacent to opponent stones for contact play (碰/靠/Tsuke).
+
+    Attaching directly to an opponent stone forces an immediate response — the
+    strongest way to invade, settle, or ignite a fight in the confined 9x9 space.
+    Only pure contact cells (adjacent to opponent, not already adjacent to own
+    stones) are returned; mixed adjacency is already covered by tactical biases.
+    """
+    opp = WHITE if color == BLACK else BLACK
+    result: set = set()
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != EMPTY:
+                continue
+            has_opp = has_own = False
+            for dr, dc in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
+                    if board[nr][nc] == opp:
+                        has_opp = True
+                    elif board[nr][nc] == color:
+                        has_own = True
+            if has_opp and not has_own:
+                result.add((r, c))
+    return result
+
+
+def _get_clamp_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return cells that clamp opponent groups against the board edge (夾/Clamp).
+
+    On the compact 9x9 board the edge is always close.  A clamp uses the boundary
+    and our stone together to strip away the opponent's escape routes and base —
+    particularly lethal against edge groups (1st–2nd line stones).
+    """
+    opp = WHITE if color == BLACK else BLACK
+    result: set = set()
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != EMPTY:
+                continue
+            for dr, dc in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                    continue
+                if board[nr][nc] != opp:
+                    continue
+                edge_dist = min(nr, BOARD_SIZE - 1 - nr, nc, BOARD_SIZE - 1 - nc)
+                if edge_dist <= 1:  # opponent stone on 1st or 2nd line
+                    result.add((r, c))
+                    break
+    return result
+
+
+def _get_ogeima_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Return empty cells at large-knight (大飛/ogeima) distance from own stones.
+
+    Ogeima = 1×3 or 3×1 jump.  Wider and faster than keima for building
+    long-range frameworks and sliding along the edge (邊上大飛).
+    """
+    result: set = set()
+    ogeima_offsets = (
+        (-1, -3), (-1, 3), (1, -3), (1, 3),
+        (-3, -1), (-3, 1), (3, -1), (3, 1),
+    )
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != color:
+                continue
+            for dr, dc in ogeima_offsets:
+                tr, tc = r + dr, c + dc
+                if (0 <= tr < BOARD_SIZE and 0 <= tc < BOARD_SIZE
+                        and board[tr][tc] == EMPTY):
+                    result.add((tr, tc))
+    return result
+
+
+def _get_territory_bridge_moves(
+    board: List[List[int]], color: int
+) -> set:
+    """Empty cells reachable via shape move from TWO+ distinct own clusters.
+
+    A cell qualifies when it can be reached by kosumi / keima / ogeima /
+    one-point-jump from stones in at least two different connected components.
+    Playing there bridges the two groups — essential for connecting own
+    territories (連接兩個自己的陣地) and for edge protection (保護邊).
+    """
+    # Label every own stone with its connected-component id.
+    comp_id: Dict[Tuple[int, int], int] = {}
+    visited: set = set()
+    cid = 0
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != color or (r, c) in visited:
+                continue
+            stack = [(r, c)]
+            while stack:
+                rr, cc = stack.pop()
+                if (rr, cc) in visited:
+                    continue
+                visited.add((rr, cc))
+                comp_id[(rr, cc)] = cid
+                for dr, dc in _NEIGHBORS:
+                    nr, nc = rr + dr, cc + dc
+                    if (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE
+                            and board[nr][nc] == color and (nr, nc) not in visited):
+                        stack.append((nr, nc))
+            cid += 1
+
+    if cid < 2:
+        return set()  # only one cluster — nothing to bridge
+
+    # Offsets for all recognised shape moves.
+    _SHAPE_OFFSETS = (
+        (-1, -1), (-1, 1), (1, -1), (1, 1),              # kosumi (尖)
+        (-2, -1), (-2, 1), (2, -1), (2, 1),
+        (-1, -2), (-1, 2), (1, -2), (1, 2),              # keima (小飛)
+        (-3, -1), (-3, 1), (3, -1), (3, 1),
+        (-1, -3), (-1, 3), (1, -3), (1, 3),              # ogeima (大飛)
+        (-2, 0), (2, 0), (0, -2), (0, 2),                # one-point jump (跳)
+    )
+
+    cell_comps: Dict[Tuple[int, int], set] = {}
+    for (r, c), cid_here in comp_id.items():
+        for dr, dc in _SHAPE_OFFSETS:
+            tr, tc = r + dr, c + dc
+            if (0 <= tr < BOARD_SIZE and 0 <= tc < BOARD_SIZE
+                    and board[tr][tc] == EMPTY):
+                if (tr, tc) not in cell_comps:
+                    cell_comps[(tr, tc)] = set()
+                cell_comps[(tr, tc)].add(cid_here)
+
+    return {cell for cell, comps in cell_comps.items() if len(comps) >= 2}
+
+
+def _get_moyo_invasion_moves(
+    board: List[List[int]], color: int, radius: int = 3
+) -> set:
+    """Empty open cells where opponent has more nearby influence than us.
+
+    A cell qualifies when it has no adjacent stones (open space, not a contact
+    play) AND there are at least 2 opponent stones within `radius` steps but
+    more opponent stones than own stones in that window.  These are the natural
+    invasion points inside the opponent's developing framework (侵入對方陣地).
+    """
+    opp = WHITE if color == BLACK else BLACK
+    result: set = set()
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if board[r][c] != EMPTY:
+                continue
+            # Must be open — no immediate contact with any stone.
+            if any(
+                board[r + dr][c + dc] != EMPTY
+                for dr, dc in _NEIGHBORS
+                if 0 <= r + dr < BOARD_SIZE and 0 <= c + dc < BOARD_SIZE
+            ):
+                continue
+            own_n = opp_n = 0
+            for dr in range(-radius, radius + 1):
+                for dc in range(-radius, radius + 1):
+                    nr, nc = r + dr, c + dc
+                    if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                        continue
+                    if board[nr][nc] == color:
+                        own_n += 1
+                    elif board[nr][nc] == opp:
+                        opp_n += 1
+            if opp_n >= 2 and opp_n > own_n + 1:
+                result.add((r, c))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # MCTS
 # ---------------------------------------------------------------------------
@@ -1081,18 +1912,20 @@ class MCTS:
         dirichlet_alpha: float = 0.3,
         dirichlet_eps: float = 0.25,
         eval_batch_size: int = 8,
-        eye_bias: float = 1.0,
-        anti_eye_bias: float = 0.8,
+        eye_bias: float = 4.0,
+        anti_eye_bias: float = 1.5,
         pass_weight: float = 0.15,
         resign_threshold: Optional[float] = None,
         capture_bias: float = 5.0,
+        atari_threat_bias: float = 4.0,
         atari_escape_bias: float = 4.0,
         connection_penalty: float = 0.35,
         double_atari_bias: float = 3.0,
         gameplay_temperature: float = 0.8,
         edge_penalty: float = 0.04,
         empty_triangle_penalty: float = 0.6,
-        nakade_bias: float = 3.0,
+        nakade_bias: float = 5.0,
+        eye_attack_bias: float = 4.5,
         cut_bias: float = 2.5,
         tiger_mouth_bias: float = 1.5,
         ko_threat_multiplier: float = 1.5,
@@ -1102,6 +1935,22 @@ class MCTS:
         hane_bias: float = 2.0,
         connection_guard_bias: float = 2.5,
         pattern_response_bias: float = 1.0,
+        self_atari_penalty: float = 0.10,
+        purposeless_penalty: float = 0.05,
+        dual_purpose_bias: float = 3.5,
+        corner_consolidation_bias: float = 2.0,
+        jump_connection_bias: float = 2.5,
+        ikken_tobi_bias: float = 5.5,
+        nobi_bias: float = 1.4,
+        kosumi_bias: float = 6.0,
+        keima_bias: float = 1.3,
+        tsuke_bias: float = 1.5,
+        clamp_bias: float = 2.0,
+        edge_eye_bias: float = 3.5,
+        ogeima_bias: float = 1.8,
+        territory_bridge_bias: float = 3.5,
+        invasion_bias: float = 2.0,
+        life_urgency_bias: float = 5.5,
     ) -> None:
         self.model           = model.to(device)
         self.model.set_inference_mode()
@@ -1120,10 +1969,12 @@ class MCTS:
         self.pass_weight      = pass_weight
         # resign when q_value drops below this during play (disabled in training)
         self.resign_threshold = resign_threshold
-        # capture_bias: prior multiplier for moves that capture opponent in atari
+        # capture_bias: prior multiplier for moves that capture opponent in atari (提子)
+        # atari_threat_bias: prior multiplier for moves that put opponent in atari (叫吃)
         # atari_escape_bias: prior multiplier for moves that escape own atari
         # connection_penalty: prior multiplier for moves that only connect safe own groups
         self.capture_bias         = capture_bias
+        self.atari_threat_bias    = atari_threat_bias
         self.atari_escape_bias    = atari_escape_bias
         self.connection_penalty   = connection_penalty
         self.double_atari_bias    = double_atari_bias
@@ -1137,6 +1988,7 @@ class MCTS:
         self.empty_triangle_penalty   = empty_triangle_penalty
         # nakade_bias: prior multiplier for vital points inside opponent eye-spaces
         self.nakade_bias              = nakade_bias
+        self.eye_attack_bias          = eye_attack_bias
         # cut_bias: prior multiplier for moves that separate distinct opponent groups
         self.cut_bias                 = cut_bias
         # tiger_mouth_bias: prior multiplier per tiger's mouth shape created
@@ -1155,8 +2007,27 @@ class MCTS:
         self.connection_guard_bias      = connection_guard_bias
         # pattern_response_bias: strength multiplier for pattern-based responses (tsuke/peep)
         self.pattern_response_bias      = pattern_response_bias
+        self.self_atari_penalty         = self_atari_penalty
+        self.purposeless_penalty        = purposeless_penalty
+        self.dual_purpose_bias              = dual_purpose_bias
+        self.corner_consolidation_bias      = corner_consolidation_bias
+        self.jump_connection_bias           = jump_connection_bias
+        self.ikken_tobi_bias                = ikken_tobi_bias
+        self.nobi_bias                      = nobi_bias
+        self.kosumi_bias                    = kosumi_bias
+        self.keima_bias                     = keima_bias
+        self.tsuke_bias                     = tsuke_bias
+        self.clamp_bias                     = clamp_bias
+        self.edge_eye_bias                  = edge_eye_bias
+        self.ogeima_bias                    = ogeima_bias
+        self.territory_bridge_bias          = territory_bridge_bias
+        self.invasion_bias                  = invasion_bias
+        self.life_urgency_bias              = life_urgency_bias
         self._eval_cache: Dict[bytes, Tuple[np.ndarray, float]] = {}
-        self._opening_priorities  = random.sample(_OPENING_PRIORITIES, len(_OPENING_PRIORITIES))
+        # Shuffle the four corner star points randomly each game.
+        self._opening_priorities: List[Tuple[int, int]] = (
+            random.sample(_OPENING_CORNERS, len(_OPENING_CORNERS))
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -1164,7 +2035,9 @@ class MCTS:
 
     def reset_game(self) -> None:
         """Reshuffle opening priorities and clear the eval cache for a new game."""
-        self._opening_priorities = random.sample(_OPENING_PRIORITIES, len(_OPENING_PRIORITIES))
+        self._opening_priorities = (
+            random.sample(_OPENING_CORNERS, len(_OPENING_CORNERS))
+        )
         self._eval_cache.clear()
 
     def check_resign(self, engine: GoEngine) -> bool:
@@ -1184,40 +2057,6 @@ class MCTS:
         self, engine: GoEngine, allow_pass: bool = True
     ) -> Optional[Tuple[int, int]]:
         legal = engine.get_legal_moves()
-
-        if not self.training:
-            legal_set = set(legal)
-            cap_moves, esc_moves = _get_tactical_moves(engine.board, engine.current_player)
-
-            # 1. Captures: always take immediately (highest priority).
-            legal_caps = sorted(cap_moves & legal_set)
-            if legal_caps:
-                return legal_caps[0]
-
-            # 2. Escape own atari: force when there is exactly one escape candidate
-            #    AND the escape gains real liberties AND it does not lead into a ladder
-            #    AND not escaping would NOT produce a beneficial snapback.
-            #    Multiple escapes, futile escapes, ladder escapes, or snapbacks → MCTS.
-            legal_escs = sorted(esc_moves & legal_set)
-            if len(legal_escs) == 1:
-                esc = legal_escs[0]
-                snapback_skips = _find_snapback_escapes(engine.board, engine.current_player)
-                if (esc not in snapback_skips
-                        and not _escape_is_futile(engine, esc)
-                        and not _is_losing_ladder(engine, esc)):
-                    return esc
-
-            # 3. Opening corners (only when no tactical urgency, and not filling own eye).
-            own_stones = sum(
-                engine.board[r][c] == engine.current_player
-                for r in range(BOARD_SIZE) for c in range(BOARD_SIZE)
-            )
-            if own_stones < len(self._opening_priorities):
-                cur = engine.current_player
-                for move in self._opening_priorities:
-                    r, c = move
-                    if engine.is_legal(r, c) and not _is_own_eye(engine.board, r, c, cur):
-                        return move
 
         if not legal and self.pass_weight <= 0.0:
             return None  # no legal board moves and pass disabled → concede
@@ -1297,6 +2136,9 @@ class MCTS:
 
         visits = {m: ch.visit_count for m, ch in root.children.items()
                   if m != _PASS}
+        if not visits:
+            return {}
+
         total  = sum(visits.values()) or 1
 
         if temperature == 0:
@@ -1517,6 +2359,21 @@ class MCTS:
                     if bonus > 0.0:
                         raw[move] *= 1.0 + bonus
 
+            # --- Edge eye bias ---
+            # Board edges act as extra walls — a 1st/2nd-line stone needs fewer
+            # neighbours to enclose an eye (邊做眼).  Give an additional multiplier
+            # on top of eye_bias so the AI learns to use the boundary for life/death.
+            if self.edge_eye_bias > 1.0:
+                for move in raw:
+                    if move == _PASS:
+                        continue
+                    r, c = move
+                    if min(r, BOARD_SIZE - 1 - r, c, BOARD_SIZE - 1 - c) > 1:
+                        continue  # not on 1st or 2nd line
+                    own_e, _ = _eye_score(board, r, c, color)
+                    if own_e > 0:
+                        raw[move] *= self.edge_eye_bias
+
         # --- Gameplay-only prior shaping (all heuristics disabled during training) ---
         # Tactical sets are computed once here and reused by every heuristic below
         # to avoid redundant board scans.
@@ -1530,12 +2387,23 @@ class MCTS:
                 else set()
             )
 
-            # Capture bias: scale by log(group_size) so capturing large groups
+            # Capture bias (提子): scale by log(group_size) so capturing large groups
             # gets proportionally more exploration than capturing lone stones.
             if self.capture_bias > 1.0:
                 for move, size in capture_sizes.items():
                     if move in raw:
                         raw[move] *= self.capture_bias * (1.0 + 0.5 * math.log1p(size - 1))
+
+            # Atari-threat bias (叫吃): boost moves that reduce an opponent group
+            # from 2 liberties to 1.  Scaled by log(group_size) so threatening a
+            # large group earns stronger exploration than threatening a single stone.
+            # Capture moves are excluded — they already receive capture_bias above.
+            # Computed unconditionally so purposeless_penalty can use it as an exemption.
+            atari_threats = _get_atari_threat_moves(board, color)
+            if self.atari_threat_bias > 1.0:
+                for move, size in atari_threats.items():
+                    if move in raw and move not in cap_moves:
+                        raw[move] *= self.atari_threat_bias * (1.0 + 0.3 * math.log1p(size - 1))
 
             # Atari-escape bias: amplify priors for moves that save own groups.
             if self.atari_escape_bias > 1.0:
@@ -1613,6 +2481,18 @@ class MCTS:
                     if move in vital:
                         raw[move] *= self.nakade_bias
 
+            # Eye-attack bias (打眼/殺眼): boost moves that invade or constrain the
+            # eye-forming space of opponent groups that haven't yet secured two real
+            # eyes.  Direct liberty invasion gets full multiplier; adjacent pressure
+            # cells get 65% (matching the life_urgency edge scaling).  This is the
+            # offensive complement to life_urgency — where life_urgency helps our own
+            # groups survive, eye_attack actively kills opponent groups.
+            if self.eye_attack_bias > 1.0:
+                eye_atk = _get_eye_attack_moves(board, color)
+                for move, mult in eye_atk.items():
+                    if move in raw:
+                        raw[move] *= self.eye_attack_bias * mult
+
             # Weak group pressure: tighten the net around opponent groups with 2-3 liberties.
             if self.weak_group_pressure_bias > 1.0:
                 pressure = _get_weak_group_pressure_moves(board, color)
@@ -1641,12 +2521,152 @@ class MCTS:
                     if move in guard:
                         raw[move] *= self.connection_guard_bias
 
+            # Dual-purpose attack: boost moves that simultaneously pressure a weak
+            # opponent group (2–3 liberties) AND are adjacent to own stones.
+            # These moves attack while building our own position — 攻守兼備.
+            if self.dual_purpose_bias > 1.0:
+                dual = _get_dual_purpose_attack_moves(board, color)
+                for move in raw:
+                    if move in dual:
+                        raw[move] *= self.dual_purpose_bias
+
+            # Corner consolidation: when we already have stones in a corner, boost
+            # moves that deepen that presence — corners are the easiest place to
+            # form two eyes (金角) so securing them before the opponent invades
+            # is almost always the right priority.
+            if self.corner_consolidation_bias > 1.0:
+                corner_moves = _get_corner_consolidation_moves(board, color)
+                for move in raw:
+                    if move in corner_moves:
+                        raw[move] *= self.corner_consolidation_bias
+
+            # Jump connection: boost one-point-jump cells that bridge two own
+            # stone clusters.  Jumps are harder to cut than solid chains and
+            # more efficient than direct connections — preferred when linking
+            # two separate positions (兩個陣地之間用跳連接).
+            if self.jump_connection_bias > 1.0:
+                jump_moves = _get_jump_connection_moves(board, color)
+                for move in raw:
+                    if move in jump_moves:
+                        raw[move] *= self.jump_connection_bias
+
+            # Ikken tobi (一間跳): primary extension/connection tool.
+            # Boosts ALL one-point jumps (2 orthogonal steps, empty middle)
+            # from any own stone — both pure extension into new territory and
+            # bridges between clusters.  This is the fastest safe way to expand
+            # influence and connect groups across the board.
+            if self.ikken_tobi_bias > 1.0:
+                ikken_moves = _get_ikken_tobi_moves(board, color)
+                for move in raw:
+                    if move in ikken_moves:
+                        raw[move] *= self.ikken_tobi_bias
+
+            # Nobi (extension/長): boost moves that extend own stone chains by
+            # one step with no opponent pressure — pure directional development.
+            # Exempt moves already captured by connection penalty (own_adj >= 2).
+            if self.nobi_bias > 1.0:
+                nobi_moves = _get_nobi_moves(board, color)
+                for move in raw:
+                    if move in nobi_moves:
+                        raw[move] *= self.nobi_bias
+
+            # Kosumi (小飛/尖): primary diagonal connection and territory tool.
+            # Boosts ALL diagonal extensions from own stones.  Together with
+            # 一間跳 these two are the main means of connecting and expanding.
+            if self.kosumi_bias > 1.0:
+                kosumi_moves = _get_kosumi_moves(board, color)
+                for move in raw:
+                    if move in kosumi_moves:
+                        raw[move] *= self.kosumi_bias
+
+            # Keima (小飛): boost knight's-move cells for fast enclosure.
+            # Faster than kosumi for sealing escape routes and building framework,
+            # though cuttable — useful for chasing and blocking on the small board.
+            if self.keima_bias > 1.0:
+                keima_moves = _get_keima_moves(board, color)
+                for move in raw:
+                    if move in keima_moves:
+                        raw[move] *= self.keima_bias
+
+            # Tsuke (碰/靠): boost pure contact plays against opponent stones.
+            # Direct attachment forces an immediate response — the fastest way
+            # to invade, settle, or start a fight in 9x9's compressed space.
+            if self.tsuke_bias > 1.0:
+                tsuke_moves = _get_tsuke_moves(board, color)
+                for move in raw:
+                    if move in tsuke_moves:
+                        raw[move] *= self.tsuke_bias
+
+            # Clamp (夾): boost moves that squeeze opponent edge groups using
+            # the board boundary.  The 9x9 edge is always nearby — a clamp
+            # can instantly seize the opponent's base (根據地).
+            if self.clamp_bias > 1.0:
+                clamp_moves = _get_clamp_moves(board, color)
+                for move in raw:
+                    if move in clamp_moves:
+                        raw[move] *= self.clamp_bias
+
+            # Ogeima (大飛): large knight's move — wider than keima for fast
+            # framework building and edge slides (邊上大飛).
+            if self.ogeima_bias > 1.0:
+                ogeima_moves = _get_ogeima_moves(board, color)
+                for move in raw:
+                    if move in ogeima_moves:
+                        raw[move] *= self.ogeima_bias
+
+            # Territory bridge: cells reachable via shape move (尖/小飛/大飛/跳)
+            # from TWO+ own clusters — plays there connect groups and protect the edge.
+            if self.territory_bridge_bias > 1.0:
+                bridge_moves = _get_territory_bridge_moves(board, color)
+                for move in raw:
+                    if move in bridge_moves:
+                        raw[move] *= self.territory_bridge_bias
+
+            # Invasion: open cells inside opponent's developing framework where
+            # we have less nearby influence — entering before the moyo closes.
+            if self.invasion_bias > 1.0:
+                invasion_moves = _get_moyo_invasion_moves(board, color)
+                for move in raw:
+                    if move in invasion_moves:
+                        raw[move] *= self.invasion_bias
+
+            # Life urgency: boost moves that help own groups with < 2 real eyes
+            # (真眼) survive.  Groups with 0 eyes (mult=2.0) receive a stronger
+            # boost than groups with 1 eye (mult=1.5), scaled by life_urgency_bias.
+            # This prevents the AI from passively letting its own territory die (死棋).
+            if self.life_urgency_bias > 1.0:
+                urgency = _get_life_urgency_moves(board, color)
+                for move, mult in urgency.items():
+                    if move in raw:
+                        raw[move] *= self.life_urgency_bias * mult
+
             # Pattern response: boost tsuke (contact) and peep-block responses.
             if self.pattern_response_bias > 0.0 and last_opp_move is not None:
                 pattern_resp = _get_pattern_response_moves(board, color, last_opp_move)
                 for move, mult in pattern_resp.items():
                     if move in raw:
                         raw[move] *= 1.0 + (mult - 1.0) * self.pattern_response_bias
+
+            # Self-atari penalty: heavily discount moves that leave the placed group
+            # with exactly 1 liberty.  Captures and escapes are exempt — capturing an
+            # opponent group in atari may look like self-atari but is correct play.
+            if self.self_atari_penalty < 1.0:
+                for move in raw:
+                    if move == _PASS or move in cap_moves or move in esc_moves:
+                        continue
+                    r, c = move
+                    if _creates_self_atari(board, r, c, color):
+                        raw[move] *= self.self_atari_penalty
+
+            # Purposeless penalty (無意義手): heavily discount moves that accomplish
+            # nothing — no nearby opponent, no own group in need, no eye creation,
+            # no territory contest.  Exempt captures, escapes, and atari threats.
+            if self.purposeless_penalty < 1.0:
+                exempt = cap_moves | esc_moves | set(atari_threats)
+                purposeless = _get_purposeless_moves(board, color, list(raw), radius=3)
+                for move in purposeless:
+                    if move in raw and move not in exempt and move != _PASS:
+                        raw[move] *= self.purposeless_penalty
 
             # Edge penalty: heavily discount first-line moves with no tactical purpose.
             # Exemptions: capture, escape, double-atari, nakade vital points, semeai fills,
@@ -1716,18 +2736,20 @@ def create_ai(
     spatial_bias: float = 1.0,
     training: bool = False,
     eval_batch_size: Optional[int] = None,
-    eye_bias: float = 1.0,
-    anti_eye_bias: float = 0.8,
+    eye_bias: float = 4.0,
+    anti_eye_bias: float = 1.5,
     pass_weight: float = 0.15,
     resign_threshold: Optional[float] = None,
     capture_bias: float = 5.0,
+    atari_threat_bias: float = 4.0,
     atari_escape_bias: float = 4.0,
     connection_penalty: float = 0.35,
     double_atari_bias: float = 3.0,
     gameplay_temperature: float = 0.8,
     edge_penalty: float = 0.04,
     empty_triangle_penalty: float = 0.6,
-    nakade_bias: float = 3.0,
+    nakade_bias: float = 5.0,
+    eye_attack_bias: float = 4.5,
     cut_bias: float = 2.5,
     tiger_mouth_bias: float = 1.5,
     ko_threat_multiplier: float = 1.5,
@@ -1737,6 +2759,22 @@ def create_ai(
     hane_bias: float = 2.0,
     connection_guard_bias: float = 2.5,
     pattern_response_bias: float = 1.0,
+    self_atari_penalty: float = 0.10,
+    purposeless_penalty: float = 0.05,
+    dual_purpose_bias: float = 2.0,
+    corner_consolidation_bias: float = 2.0,
+    jump_connection_bias: float = 2.5,
+    ikken_tobi_bias: float = 5.5,
+    nobi_bias: float = 1.4,
+    kosumi_bias: float = 6.0,
+    keima_bias: float = 1.3,
+    tsuke_bias: float = 1.5,
+    clamp_bias: float = 2.0,
+    edge_eye_bias: float = 3.5,
+    ogeima_bias: float = 1.8,
+    territory_bridge_bias: float = 3.5,
+    invasion_bias: float = 2.0,
+    life_urgency_bias: float = 4.0,
 ) -> MCTS:
     if device is None:
         if torch.cuda.is_available():
@@ -1757,13 +2795,15 @@ def create_ai(
                 eval_batch_size=eval_batch_size,
                 eye_bias=eye_bias, anti_eye_bias=anti_eye_bias,
                 pass_weight=pass_weight, resign_threshold=resign_threshold,
-                capture_bias=capture_bias, atari_escape_bias=atari_escape_bias,
+                capture_bias=capture_bias, atari_threat_bias=atari_threat_bias,
+                atari_escape_bias=atari_escape_bias,
                 connection_penalty=connection_penalty,
                 double_atari_bias=double_atari_bias,
                 gameplay_temperature=gameplay_temperature,
                 edge_penalty=edge_penalty,
                 empty_triangle_penalty=empty_triangle_penalty,
                 nakade_bias=nakade_bias,
+                eye_attack_bias=eye_attack_bias,
                 cut_bias=cut_bias,
                 tiger_mouth_bias=tiger_mouth_bias,
                 ko_threat_multiplier=ko_threat_multiplier,
@@ -1772,7 +2812,23 @@ def create_ai(
                 semeai_bias=semeai_bias,
                 hane_bias=hane_bias,
                 connection_guard_bias=connection_guard_bias,
-                pattern_response_bias=pattern_response_bias)
+                pattern_response_bias=pattern_response_bias,
+                self_atari_penalty=self_atari_penalty,
+                purposeless_penalty=purposeless_penalty,
+                dual_purpose_bias=dual_purpose_bias,
+                corner_consolidation_bias=corner_consolidation_bias,
+                jump_connection_bias=jump_connection_bias,
+                ikken_tobi_bias=ikken_tobi_bias,
+                nobi_bias=nobi_bias,
+                kosumi_bias=kosumi_bias,
+                keima_bias=keima_bias,
+                tsuke_bias=tsuke_bias,
+                clamp_bias=clamp_bias,
+                edge_eye_bias=edge_eye_bias,
+                ogeima_bias=ogeima_bias,
+                territory_bridge_bias=territory_bridge_bias,
+                invasion_bias=invasion_bias,
+                life_urgency_bias=life_urgency_bias)
 
 
 # ---------------------------------------------------------------------------
